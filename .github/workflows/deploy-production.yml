@@ -1,0 +1,206 @@
+name: Deploy production
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: production
+  cancel-in-progress: false
+
+jobs:
+  select:
+    if: >-
+      github.repository == 'kuhne12/codex-proxy-rs' &&
+      (github.event_name == 'workflow_dispatch' ||
+       (github.event.workflow_run.conclusion == 'success' &&
+        github.event.workflow_run.event == 'push' &&
+        github.event.workflow_run.head_repository.full_name == github.repository))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      sha: ${{ steps.select.outputs.sha }}
+      deploy: ${{ steps.select.outputs.deploy }}
+    steps:
+      - name: Select current main with successful CI
+        id: select
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          CANDIDATE: ${{ github.event.workflow_run.head_sha || github.sha }}
+          REF: ${{ github.ref }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT" = workflow_dispatch && "$REF" != refs/heads/main ]]; then
+            echo 'Manual production deployment requires main' >&2
+            exit 1
+          fi
+          current="$(gh api "repos/$REPOSITORY/commits/main" --jq .sha)"
+          if [[ "$CANDIDATE" != "$current" ]]; then
+            echo 'deploy=false' >> "$GITHUB_OUTPUT"
+            echo "Skipping superseded commit $CANDIDATE" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          conclusion="$(gh api "repos/$REPOSITORY/actions/workflows/ci.yml/runs?event=push&branch=main&head_sha=$CANDIDATE&per_page=1" --jq '.workflow_runs[0].conclusion')"
+          test "$conclusion" = success
+          echo "sha=$CANDIDATE" >> "$GITHUB_OUTPUT"
+          echo 'deploy=true' >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: select
+    if: needs.select.outputs.deploy == 'true'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+      security-events: write
+    outputs:
+      digest: ${{ steps.image.outputs.digest }}
+    env:
+      CI: 'true'
+      CPR_GIT_SHA: ${{ needs.select.outputs.sha }}
+      CPR_BUILD_TYPE: source
+      IMAGE_NAME: ghcr.io/kuhne12/codex-proxy-rs
+    steps:
+      - name: Checkout verified commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.select.outputs.sha }}
+          persist-credentials: false
+
+      - name: Read build metadata
+        id: metadata
+        run: |
+          set -euo pipefail
+          ruby .github/scripts/toolchains.rb >> "$GITHUB_OUTPUT"
+          version="$(ruby -ryaml -e 'puts YAML.load_file("release/version.yaml").fetch("version").delete_prefix("v")')"
+          echo "CPR_VERSION=$version+git.${CPR_GIT_SHA:0:12}" >> "$GITHUB_ENV"
+          echo "CPR_BUILD_TIME=$(date -u +%FT%TZ)" >> "$GITHUB_ENV"
+
+      - name: Validate and build frontend
+        uses: ./.github/actions/build-frontend
+
+      - name: Build native ARM64 binary
+        uses: ./.github/actions/build-binary
+        with:
+          rust: ${{ steps.metadata.outputs.rust }}
+          rust-image: ${{ steps.metadata.outputs.rust_image }}
+          target: aarch64-unknown-linux-gnu
+          platform: linux-arm64
+
+      - name: Prepare runtime assets
+        env:
+          MATRIX_OS: linux
+          MATRIX_ARCH: arm64
+          MATRIX_BINARY: codex-proxy-rs
+        run: |
+          set -euo pipefail
+          mkdir -p dist/docker/web/dist dist/docker-artifacts/codex-proxy-rs-linux-arm64
+          cp -a frontend/dist/. dist/docker/web/dist/
+          cp dist/binaries/linux-arm64/codex-proxy-rs dist/docker-artifacts/codex-proxy-rs-linux-arm64/
+          ruby -r './.github/scripts/release-metadata' -e '
+            ReleaseMetadata.seal_manifest(
+              "version" => ENV.fetch("CPR_VERSION"),
+              "git_sha" => ENV.fetch("CPR_GIT_SHA")
+            )'
+          ruby .github/scripts/package-release.rb image
+
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Login to GHCR
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and publish immutable candidate
+        id: image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: deploy/Dockerfile
+          target: runtime-prebuilt
+          platforms: linux/arm64
+          push: true
+          build-args: CPR_PREBUILT_DIR=dist/docker
+          tags: ${{ env.IMAGE_NAME }}:sha-${{ needs.select.outputs.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/kuhne12/codex-proxy-rs
+            org.opencontainers.image.revision=${{ needs.select.outputs.sha }}
+            org.opencontainers.image.version=${{ env.CPR_VERSION }}
+          cache-from: type=gha,scope=production-arm64
+          cache-to: type=gha,scope=production-arm64,mode=max
+          no-cache-filters: runtime-base
+          provenance: mode=max
+          sbom: true
+
+      - name: Scan and verify exact image
+        uses: ./.github/actions/verify-container
+        with:
+          image: ${{ env.IMAGE_NAME }}@${{ steps.image.outputs.digest }}
+          platform: linux/arm64
+          artifact-name: production-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Publish latest verified image
+        env:
+          IMAGE_DIGEST: ${{ steps.image.outputs.digest }}
+        run: |
+          set -euo pipefail
+          [[ "$IMAGE_DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]]
+          docker buildx imagetools create --tag "$IMAGE_NAME:latest" "$IMAGE_NAME@$IMAGE_DIGEST"
+          printf 'Verified image: %s@%s\nCommit: %s\n' "$IMAGE_NAME" "$IMAGE_DIGEST" "$CPR_GIT_SHA" >> "$GITHUB_STEP_SUMMARY"
+
+  deploy:
+    needs: [select, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment:
+      name: production
+      url: http://152.53.55.111:18082
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Deploy verified digest using restricted SSH key
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.PRODUCTION_SSH_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.PRODUCTION_KNOWN_HOSTS }}
+          REGISTRY_TOKEN: ${{ github.token }}
+          IMAGE_DIGEST: ${{ needs.build.outputs.digest }}
+          COMMIT: ${{ needs.select.outputs.sha }}
+          RUN: ${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          [[ "$IMAGE_DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]]
+          [[ "$COMMIT" =~ ^[a-f0-9]{40}$ ]]
+          umask 077
+          key_dir="$(mktemp -d)"
+          trap 'rm -rf "$key_dir"' EXIT
+          printf '%s\n' "$SSH_PRIVATE_KEY" > "$key_dir/key"
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > "$key_dir/known_hosts"
+          printf '%s\n' "$REGISTRY_TOKEN" | ssh -T -i "$key_dir/key" \
+            -o IdentitiesOnly=yes -o BatchMode=yes \
+            -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$key_dir/known_hosts" \
+            -o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=4 \
+            fkh@152.53.55.111 "deploy $IMAGE_DIGEST $COMMIT $RUN"
+
+      - name: Check public readiness
+        run: |
+          set -euo pipefail
+          for path in healthz readyz; do
+            test "$(curl --noproxy '*' -sS --retry 3 --max-time 15 -o /dev/null -w '%{http_code}' "http://152.53.55.111:18082/$path")" = 204
+          done
+          echo 'Production health and readiness checks passed: http://152.53.55.111:18082' >> "$GITHUB_STEP_SUMMARY"

@@ -805,6 +805,59 @@ OAuth 恢复开关为 `host.logging.oauth_recovery`，默认关闭，与普通�
 密码变更后需要用新配置重新创建 Redis 和应用容器，不需要删除 Redis 数据目录。
 安排维护窗口，避免应用和 Redis 在过渡期间使用不同密码
 
+## Fork 生产自动部署
+
+kuhne12/codex-proxy-rs 的 main 更新后先运行 CI；同一提交的 CI 成功才触发
+[Deploy production](../.github/workflows/deploy-production.yml)。PR 本身不部署。
+手动重跑需在 Actions 选择 main，并且该提交最近一次 push CI 已成功。
+
+流程在 GitHub 托管 ARM64 runner 构建，复用前端检查、Rust 构建和完整运行镜像验证；
+HIGH/CRITICAL 且可修复的镜像漏洞会阻止部署。镜像发布到
+ghcr.io/kuhne12/codex-proxy-rs，以 sha-提交-运行号-尝试号留档，latest 仅表示最新通过验证的镜像。
+生产容器固定使用摘要，并在 OCI 标签和管理端版本信息保留源码提交。
+
+生产目标为 fkh@152.53.55.111 的 /home/fkh/apps/codex-proxy-rs，
+对外地址 http://152.53.55.111:18082。本地容器仍手动更新。
+源码构建标记为 source，管理端不执行上游官方二进制在线升级，以 Actions 部署为准。
+更新应用会断开现有流式连接，客户端需重新连接。
+
+### 部署凭据与服务器入口
+
+GitHub production Environment 仅允许 main，配置两个 Secret：
+
+| Secret | 用途 |
+| --- | --- |
+| PRODUCTION_SSH_KEY | 专用 Ed25519 私钥 |
+| PRODUCTION_KNOWN_HOSTS | 已核实的服务器 SSH 主机公钥 |
+
+服务器 authorized_keys 中，该密钥使用 restrict 和强制命令：
+/home/fkh/apps/codex-proxy-rs/.runtime/cd/deploy-production.sh /home/fkh/apps/codex-proxy-rs。
+入口脚本由管理员从 [deploy-production.sh](deploy-production.sh) 安装，不接受工作流上传或任意远程命令。
+修改脚本后须由管理员同步该入口；普通应用代码部署不自动替换它。
+
+GHCR 推送和拉取分别使用当前工作流的 GITHUB_TOKEN，服务器通过标准输入接收临时凭据，
+仅写入本次临时 DOCKER_CONFIG，任务结束删除。数据库及管理员密码继续保存在服务器 config.yaml，
+不上传到 GitHub。不要用私人 GitHub PAT 或日常 SSH 私钥替代专用凭据。
+
+### 部署记录、失败与恢复
+
+GitHub 并发组和服务器 flock 串行化部署；执行前核对提交仍是 main 最新提交，跳过过时构建。
+入口只接受本仓库 sha256 镜像摘要，验证 ARM64 架构和提交标签，再停止应用、生成备份。
+PostgreSQL 和 Redis 保持运行，配置和数据挂载保留，仅重建应用容器。
+
+.runtime/cd/backups/时间-运行号/ 包含 PostgreSQL 自定义格式整库备份、应用数据归档、
+配置、上一镜像和迁移记录。备份在服务器保留，不自动上传或删除，需定期转存和清理。
+.runtime/cd/history.tsv、current-image、current-commit 记录成功部署。
+
+启动后必须通过 /healthz、/readyz 和镜像提交核对，Actions 另检查公网健康状态。
+失败时先停止新容器；只有数据库迁移记录与升级前一致才自动恢复上一镜像。
+迁移有变化或无法读取时保持应用停止，工作流失败，由管理员参考备份处理；
+不自动还原数据库，避免覆盖升级后的有效写入。
+
+手动操作实例时始终使用 deploy/compose.instance.yaml。
+不要修改 latest 来回滚生产；核对数据库迁移兼容性后恢复上一摘要，
+涉及数据库恢复时按本页“人工恢复数据库”操作。
+
 ## 镜像升级与源码构建
 
 每个 Release 独立提供 `config.example.yaml`、默认镜像固定到该版本的 `compose.yaml` 和校验和；
