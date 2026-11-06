@@ -22,6 +22,8 @@ export interface AccountRequestBar {
 }
 
 interface AccountLocalUsage {
+  usdDisplay?: string
+  incompleteCost?: boolean
   requestCount?: number
   requestCountDisplay?: string
   totalTokens?: number
@@ -177,7 +179,13 @@ function accountLocalUsage(value: unknown): AccountLocalUsage | null {
 
   const localUsage: AccountLocalUsage = {
     requestBuckets: requestBuckets(value.requestBuckets),
+    incompleteCost: value.incompleteCost === true,
   }
+  const usd = Array.isArray(value.costs)
+    ? value.costs.find(cost => isRecord(cost) && typeof cost.currency === 'string' && cost.currency.toUpperCase() === 'USD')
+    : undefined
+  if (isRecord(usd) && typeof usd.estimatedAmountDisplay === 'string')
+    localUsage.usdDisplay = usd.estimatedAmountDisplay
   if (finiteNumber(value.requestCount))
     localUsage.requestCount = value.requestCount
   if (typeof value.requestCountDisplay === 'string')
@@ -256,6 +264,8 @@ export function quotaWindowDetails(window: AccountQuotaWindow) {
         : null,
     ].filter(Boolean).join(' · '),
     localUsageDisplay: tokenDisplay,
+    usdDisplay: localUsage?.usdDisplay ?? '—',
+    incompleteCost: localUsage?.incompleteCost ?? false,
     amountUsedDisplay: amountDisplay,
     quotaValueDisplay: window.amount && window.usedPercent === null
       ? window.amount.totalDisplay

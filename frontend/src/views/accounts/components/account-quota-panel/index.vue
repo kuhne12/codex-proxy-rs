@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import type { Account } from '@/api'
 
-import { ZEmpty, ZIconButton, ZScrollbar } from '@codex-proxy/ui'
+import { ZButton, ZEmpty, ZIconButton, ZScrollbar } from '@codex-proxy/ui'
 
 import { ChartNoAxesCombined, RefreshCw, UserRound } from '@lucide/vue'
 
@@ -13,6 +13,7 @@ import { usePoolQuotaWindows } from '../../composables/usePoolQuotaWindows'
 import { groupedAccountQuotaWindows, orderedPanelQuotaWindows } from '../../constants'
 import AccountProfileModal from '../account-profile-modal/index.vue'
 import AccountQuotaForecastModal from '../account-quota-forecast-modal/index.vue'
+import AccountQuotaCredits from './Credits.vue'
 import AccountQuotaPanelEntry from './Entry.vue'
 import AccountResetCredits from './ResetCredits.vue'
 import AccountUpstreamPool from './UpstreamPool.vue'
@@ -95,20 +96,22 @@ watch(hasPersonalInfo, (available) => {
           :account="account"
           @consumed="emit('quotaReset', $event)"
         />
-        <ZIconButton
+        <ZButton
           v-if="hasForecast"
           :aria-label="t('accounts.quota.forecastWeeklyMonthlyQuota')"
           size="small"
+          variant="text"
           aria-haspopup="dialog"
-          :pressed="forecastOpen"
+          :aria-expanded="forecastOpen"
           @click="forecastOpen = true"
         >
           <ChartNoAxesCombined class="size-3.5" />
-        </ZIconButton>
+          {{ t('accounts.quota.estimatedTotal') }}
+        </ZButton>
         <ZIconButton
           v-if="canRefresh"
           size="small"
-          :aria-label="t('accounts.quotaForecast.refreshQuota')"
+          :aria-label="t('accounts.quota.refreshUsageAndCredits')"
           :loading="refreshing"
           :disabled="refreshing"
           @click="emit('refreshQuota', account.id)"
@@ -121,6 +124,11 @@ watch(hasPersonalInfo, (available) => {
       </div>
     </div>
 
+    <AccountQuotaCredits
+      v-if="account.provider === 'openai' && account.authenticationKind !== 'api_key' || account.quota.credits"
+      :credits="account.quota.credits"
+      class="px-0! pb-3!"
+    />
     <div v-if="quotaEntries.length === 0 && !hasUpstreamPool" class="grid flex-1 place-items-center">
       <ZEmpty
         :title="!account.capabilities.quota && !account.upstream?.discovered ? t('accounts.quota.queryUnsupported') : t('accounts.quota.unobserved')"

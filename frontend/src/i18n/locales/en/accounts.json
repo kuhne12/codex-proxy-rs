@@ -1,6 +1,11 @@
 {
   "accounts": {
     "quota": {
+      "windowUsd": "Window usage (USD)",
+      "partialCost": "Partial",
+      "estimatedTotal": "Estimated total",
+      "refreshUsageAndCredits": "Query usage and credits",
+      "windowUsdHelp": "Amounts reflect locally recorded window usage at model prices in USD, not subscription charges or credit balances",
       "general": "General quota",
       "usageInThisWindow": "Usage in this window: {localUsageDisplay}",
       "quotaUsed": "Quota used: {rate}",

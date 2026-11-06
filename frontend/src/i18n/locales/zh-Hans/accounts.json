@@ -1,6 +1,11 @@
 {
   "accounts": {
     "quota": {
+      "windowUsd": "窗口用量（USD）",
+      "partialCost": "部分",
+      "estimatedTotal": "预计总额",
+      "refreshUsageAndCredits": "查询用量与积分",
+      "windowUsdHelp": "金额仅包含本站记录的窗口用量，按模型价格折算为 USD，不代表订阅账单或积分余额",
       "general": "通用额度",
       "usageInThisWindow": "窗口消耗：{localUsageDisplay}",
       "quotaUsed": "额度已使用：{rate}",

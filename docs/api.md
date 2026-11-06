@@ -1627,6 +1627,11 @@ OpenAI 授权码交换与令牌刷新请求的连接超时为 30 秒，单次上
   小于 1 美元时最多保留四位小数，其余最多保留两位，小数末尾不补零。
   额度百分比展示最多保留一位小数，小数末尾不补零；数值为零时返回 `0%`
 
+账号额度窗口的 `localUsage.costs` 按当前窗口边界返回已记录费用，沿用 `currency`、
+`estimatedAmount` 和 `estimatedAmountDisplay` 的金额合同；`incompleteCost` 表示存在部分或未知费用。
+缺少 USD 记录时不将其当作零，非 USD 金额不自动换汇。窗口费用仅表示本站记录的模型等价用量，
+不是订阅价格或积分余额
+
 ### 周/月额度预测
 
 `GET /api/admin/accounts/quota-forecast?accountId=...` 使用管理员鉴权，每次查询返回独立的预测结果。

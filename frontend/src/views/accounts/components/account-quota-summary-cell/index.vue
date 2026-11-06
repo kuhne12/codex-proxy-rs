@@ -35,7 +35,7 @@ const summaryEntries = computed(() => props.account.upstream?.discovered && visi
     ]
   : groupedAccountQuotaWindows(visibleQuotaWindows.value))
 const hasTokenUsage = computed(() => (props.account.usage.totalTokens ?? 0) > 0)
-const recentUsageEntry = computed(() => recentlyUsedQuotaEntry(
+const recentUsageEntry = computed(() => summaryEntries.value.find(entry => entry.windows.some(window => window.limitId === 'codex')) ?? recentlyUsedQuotaEntry(
   summaryEntries.value,
   props.account.usage.models,
 ))

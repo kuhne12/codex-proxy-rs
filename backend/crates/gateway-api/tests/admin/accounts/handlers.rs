@@ -446,8 +446,8 @@ fn account_page_item(
 #[tokio::test]
 async fn account_usage_preserves_periods_cache_counts_and_missing_values() {
     use chrono::Utc;
-    use gateway_admin::model::accounts::{AccountModelUsage, AccountUsage};
-    use gateway_admin::model::observability::RequestHealth;
+    use gateway_admin::model::accounts::{AccountCost, AccountModelUsage, AccountUsage};
+    use gateway_admin::model::observability::{CostCoverage, RequestHealth};
     use gateway_admin::model::provider_credentials::{
         ProviderQuota, ProviderQuotaWindow, QuotaLocalUsageAttribution,
     };
@@ -469,6 +469,7 @@ async fn account_usage_preserves_periods_cache_counts_and_missing_values() {
         ("api_key", Some(13), Some(7)),
         ("api_key", None, None),
         ("oauth", Some(13), Some(7)),
+        ("oauth", Some(0), None),
         ("oauth", None, None),
     ] {
         let mut account = account_page_item(facts.clone(), now, authentication_kind);
@@ -491,8 +492,18 @@ async fn account_usage_preserves_periods_cache_counts_and_missing_values() {
             image_request_count: 0,
             image_request_failed_count: 0,
             total_tokens: Some(120),
-            cost_coverage: Default::default(),
-            costs: Vec::new(),
+            cost_coverage: CostCoverage {
+                calculated_count: u64::from(read.is_some()),
+                partial_count: u64::from(write.is_some()),
+                unavailable_count: u64::from(read.is_none()),
+                ..Default::default()
+            },
+            costs: read.map_or_else(Vec::new, |count| {
+                vec![AccountCost {
+                    currency: "USD".to_owned(),
+                    amount: if count == 0 { "0" } else { "0.012345" }.parse().unwrap(),
+                }]
+            }),
             last_used_at: Some(now),
             request_buckets: vec![gateway_admin::model::accounts::AccountRequestBucket {
                 bucket_start: now,
@@ -587,6 +598,22 @@ async fn account_usage_preserves_periods_cache_counts_and_missing_values() {
             let window = &value["data"]["items"][0]["quota"]["windows"][0];
             assert_eq!(window["localUsage"]["requestCount"], 1);
             assert_eq!(
+                window["localUsage"]["incompleteCost"],
+                read.is_none() || write.is_some()
+            );
+            if read.is_some() {
+                assert_eq!(
+                    window["localUsage"]["costs"][0]["estimatedAmount"],
+                    if read == Some(0) { "0" } else { "0.012345" }
+                );
+                assert_eq!(
+                    window["localUsage"]["costs"][0]["estimatedAmountDisplay"],
+                    if read == Some(0) { "$0" } else { "$0.0123" }
+                );
+            } else {
+                assert_eq!(window["localUsage"]["costs"], serde_json::json!([]));
+            }
+            assert_eq!(
                 window["localUsage"]["requestBuckets"]
                     .as_array()
                     .unwrap()
@@ -598,7 +625,7 @@ async fn account_usage_preserves_periods_cache_counts_and_missing_values() {
         assert_eq!(usage["cacheWriteInputTokens"], serde_json::json!(write));
         assert_eq!(
             usage["cachedInputTokensDisplay"],
-            if read.is_some() { "13" } else { "—" }
+            read.map_or_else(|| "—".to_owned(), |value| value.to_string())
         );
         assert_eq!(
             usage["cacheWriteInputTokensDisplay"],

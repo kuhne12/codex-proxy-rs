@@ -132,6 +132,15 @@ function quotaWindowCode(windowSeconds: number | null, role: AccountQuotaWindow[
             </dd>
           </template>
           <template v-else>
+            <template v-if="showConsumption">
+              <dt class="font-emphasis text-z-text-tertiary">
+                {{ t('accounts.quota.windowUsd') }}
+              </dt>
+              <dd class="m-0 text-right font-mono font-heavy tabular-nums text-z-text">
+                {{ item.usdDisplay }}
+                <span v-if="item.incompleteCost" class="text-z-warning-text">{{ t('accounts.quota.partialCost') }}</span>
+              </dd>
+            </template>
             <template v-if="showConsumption && item.consumptionDisplay">
               <dt class="font-emphasis text-z-text-tertiary">
                 {{ t('accounts.quota.windowConsumption') }}
@@ -149,6 +158,9 @@ function quotaWindowCode(windowSeconds: number | null, role: AccountQuotaWindow[
           </template>
         </dl>
       </article>
+      <p v-if="showConsumption" class="m-0 text-[10px] leading-4 text-z-text-tertiary">
+        {{ t('accounts.quota.windowUsdHelp') }}
+      </p>
     </div>
   </section>
 </template>

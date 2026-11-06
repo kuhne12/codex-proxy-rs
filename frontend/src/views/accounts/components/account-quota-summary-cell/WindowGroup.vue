@@ -3,7 +3,7 @@ import type { AccountQuotaWindow } from '@/api'
 
 import { computed } from 'vue'
 import { useI18n } from 'vue-i18n'
-import { quotaWindowLabel, quotaWindowPresentation } from '@/components/account/account-usage-window/presenter'
+import { quotaWindowDetails, quotaWindowLabel, quotaWindowPresentation } from '@/components/account/account-usage-window/presenter'
 
 const props = withDefaults(defineProps<{
   label: string
@@ -15,7 +15,9 @@ const props = withDefaults(defineProps<{
 const { t } = useI18n({ useScope: 'global' })
 
 const windowItems = computed(() => props.windows.map(window => ({
+  ...quotaWindowDetails(window),
   key: window.key,
+  label: quotaWindowLabel(window, false),
   labelTooltip: quotaWindowLabel(window),
   usedPercent: window.usedPercent,
   usedPercentDisplay: window.usedPercentDisplay,
@@ -33,10 +35,6 @@ const highestUsageDisplay = computed(() => highestUsageWindow.value?.usedPercent
 const highestUsageTextClass = computed(() => highestUsageWindow.value
   ? quotaWindowPresentation(highestUsageWindow.value, '2px').percentTextClass
   : 'text-z-text-quaternary')
-
-const trackGridStyle = computed(() => ({
-  gridTemplateColumns: `repeat(${Math.max(windowItems.value.length, 1)}, minmax(0, 1fr))`,
-}))
 </script>
 
 <template>
@@ -54,23 +52,32 @@ const trackGridStyle = computed(() => ({
       </strong>
     </div>
 
-    <div class="col-span-full grid min-w-0 gap-1" :style="trackGridStyle">
-      <div
-        v-for="item in windowItems"
-        :key="item.key"
-        class="h-1 w-full overflow-hidden rounded-full bg-z-border-secondary"
-        role="progressbar"
-        :aria-label="item.labelTooltip"
-        aria-valuemin="0"
-        aria-valuemax="100"
-        :aria-valuenow="item.stale ? undefined : item.usedPercent ?? undefined"
-        :aria-valuetext="item.stale ? t('accounts.upstream.stale') : item.usedPercentDisplay"
-      >
+    <div class="col-span-full grid min-w-0 gap-2">
+      <div v-for="item in windowItems" :key="item.key" class="grid min-w-0 gap-1">
+        <div class="flex flex-wrap items-baseline justify-between gap-x-2 text-[10px] leading-3.5">
+          <span class="text-z-text-secondary">{{ item.label }}</span>
+          <span class="flex items-baseline gap-1.5 font-mono tabular-nums">
+            <span class="text-z-text-secondary">{{ item.usdDisplay }}</span>
+            <span v-if="item.incompleteCost" class="text-z-warning-text">{{ t('accounts.quota.partialCost') }}</span>
+            <strong :class="item.presentation.percentTextClass">{{ item.usedPercentDisplay }}</strong>
+            <span v-if="item.stale" class="text-z-warning-text">{{ t('accounts.upstream.stale') }}</span>
+          </span>
+        </div>
         <div
-          class="h-full rounded-full transition-[width,background-color] duration-200 motion-reduce:transition-none"
-          :class="item.presentation.barClass"
-          :style="item.presentation.barStyle"
-        />
+          class="h-1 w-full overflow-hidden rounded-full bg-z-border-secondary"
+          role="progressbar"
+          :aria-label="item.labelTooltip"
+          aria-valuemin="0"
+          aria-valuemax="100"
+          :aria-valuenow="item.stale ? undefined : item.usedPercent ?? undefined"
+          :aria-valuetext="item.stale ? t('accounts.upstream.stale') : item.usedPercentDisplay"
+        >
+          <div
+            class="h-full rounded-full transition-[width,background-color] duration-200 motion-reduce:transition-none"
+            :class="item.presentation.barClass"
+            :style="item.presentation.barStyle"
+          />
+        </div>
       </div>
     </div>
   </div>

@@ -364,6 +364,8 @@ pub(super) fn quota_local_usage(usage: &AccountUsage, time: crate::time::TimePre
         "imageRequestFailedCount": usage.image_request_failed_count,
         "totalTokens": total_tokens,
         "totalTokensDisplay": format_compact_number(total_tokens),
+        "costs": usage.costs.iter().map(account_currency_cost_view).collect::<Vec<_>>(),
+        "incompleteCost": usage.cost_coverage.unavailable_count > 0 || usage.cost_coverage.partial_count > 0,
         "requestBuckets": time.request_buckets(usage.request_buckets.iter().map(|bucket| (bucket.bucket_start, bucket.request_count))),
     })
 }

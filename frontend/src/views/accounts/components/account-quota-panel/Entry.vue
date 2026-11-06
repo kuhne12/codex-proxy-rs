@@ -94,6 +94,13 @@ const items = computed(() => props.windows.map((window) => {
           </p>
         </template>
         <template v-else>
+          <div class="flex flex-wrap items-baseline justify-between gap-1 text-z-xs text-z-text-secondary">
+            <span>{{ t('accounts.quota.windowUsd') }}</span>
+            <span class="font-mono tabular-nums">
+              {{ item.usdDisplay }}
+              <span v-if="item.incompleteCost" class="text-z-warning-text">{{ t('accounts.quota.partialCost') }}</span>
+            </span>
+          </div>
           <div class="flex min-w-0 items-baseline justify-between gap-2 text-z-xs leading-3.5">
             <span class="min-w-0 truncate font-bold text-z-text-quaternary" :title="item.observationDisplay || undefined">
               {{ item.label }}
