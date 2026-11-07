@@ -1,9 +1,10 @@
 <script setup lang="ts">
-import { ZButton, ZInput } from '@codex-proxy/ui'
+import { ZButton, ZCheckbox, ZInput } from '@codex-proxy/ui'
 
 import { Plus, Search, Trash2 } from '@lucide/vue'
 
 import { useI18n } from 'vue-i18n'
+import { useUiStore } from '@/stores/modules/ui'
 
 defineProps<{
   batchDeleting: boolean
@@ -15,6 +16,7 @@ const emit = defineEmits<{
   deleteSelected: []
 }>()
 
+const ui = useUiStore()
 const { t } = useI18n({ useScope: 'global' })
 
 const search = defineModel<string>('search', { required: true })
@@ -32,6 +34,7 @@ const search = defineModel<string>('search', { required: true })
         <Search class="size-4.5 text-z-text-tertiary" />
       </template>
     </ZInput>
+    <ZCheckbox v-model="ui.showPluginGroups" :label="t('groups.filters.showPluginGroups')" />
     <div class="flex max-w-full shrink-0 flex-wrap items-center justify-end gap-2 sm:ml-auto">
       <ZButton
         v-if="selectedCount > 0"

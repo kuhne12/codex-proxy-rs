@@ -524,8 +524,8 @@ impl ProxyStore for PgProxyRepository {
         if !items.is_empty() {
             // 仅批量加载当前页的分组，并沿用同一快照，避免逐账号查询
             let account_ids: Vec<&str> = items.iter().map(|account| account.id.as_str()).collect();
-            let rows = sqlx::query_as::<_, (String, String, String, String, bool)>(
-                "select m.provider_account_id, g.id, g.name, g.color, g.enabled
+            let rows = sqlx::query_as::<_, (String, String, String, String, bool, bool)>(
+                "select m.provider_account_id, g.id, g.name, g.color, g.enabled, exists (select 1 from plugin_account_group_resources r where r.group_id = g.id)
                  from account_group_accounts m join account_groups g on g.id = m.account_group_id
                  where m.provider_account_id = any($1::text[])
                  order by m.provider_account_id, g.id",
@@ -535,8 +535,9 @@ impl ProxyStore for PgProxyRepository {
             .await
             .map_err(|source| store_error(unavailable(source)))?;
             let mut groups = BTreeMap::<String, Vec<AccountGroupRef>>::new();
-            for (account_id, group_id, name, color, enabled) in rows {
+            for (account_id, group_id, name, color, enabled, plugin_owned) in rows {
                 groups.entry(account_id).or_default().push(AccountGroupRef {
+                    plugin_owned,
                     id: AccountGroupId::new(group_id).map_err(|_| store_error(invalid()))?,
                     name,
                     color: AccountGroupColor::parse(&color)

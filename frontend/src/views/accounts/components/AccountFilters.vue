@@ -1,12 +1,13 @@
 <script setup lang="ts">
 import type { AccountGroupRef } from '@/api'
 
-import { ZButton, ZIconButton, ZInput, ZMenuItem, ZPopover, ZSelect } from '@codex-proxy/ui'
+import { ZButton, ZCheckbox, ZIconButton, ZInput, ZMenuItem, ZPopover, ZSelect } from '@codex-proxy/ui'
 import { Download, ListTodo, MoreHorizontal, Pencil, Search, Trash2, Upload } from '@lucide/vue'
 
 import { computed } from 'vue'
 import { useI18n } from 'vue-i18n'
 import ProviderFilter from '@/components/ProviderFilter.vue'
+import { useUiStore } from '@/stores/modules/ui'
 import { accountStatusFilterOptions } from '../constants'
 
 const props = defineProps<{
@@ -28,6 +29,7 @@ const emit = defineEmits<{
   editSelected: []
 }>()
 
+const ui = useUiStore()
 const { t } = useI18n({ useScope: 'global' })
 
 const search = defineModel<string>('search', { required: true })
@@ -86,6 +88,8 @@ const groupOptions = computed(() => [
         :aria-label="t('accounts.filters.groupLabel')"
         class="w-full min-w-0 xl:w-40 xl:shrink-0"
       />
+
+      <ZCheckbox v-model="ui.showPluginGroups" :label="t('groups.filters.showPluginGroups')" class="col-span-2 sm:col-span-3" />
 
       <ProviderFilter
         v-model="provider"

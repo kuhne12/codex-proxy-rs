@@ -49,6 +49,7 @@ async fn group_query_service_enriches_only_current_page_members_with_runtime_fac
     let page = service
         .account_groups()
         .list(AccountGroupListQuery {
+            include_plugin_owned: true,
             page: 1,
             page_size: PageSize::new(20).expect("page size"),
             search: None,
@@ -104,6 +105,7 @@ async fn group_options_query_should_skip_member_and_runtime_enrichment() {
     let page = service
         .account_groups()
         .list_options(AccountGroupListQuery {
+            include_plugin_owned: true,
             page: 1,
             page_size: PageSize::new(20).expect("page size"),
             search: None,
@@ -136,6 +138,7 @@ async fn group_options_query_should_preserve_store_failures() {
     let error = service
         .account_groups()
         .list_options(AccountGroupListQuery {
+            include_plugin_owned: true,
             page: 1,
             page_size: PageSize::new(20).expect("page size"),
             search: None,
@@ -177,6 +180,7 @@ async fn group_capacity_only_becomes_unlimited_for_available_unlimited_members()
         let page = service
             .account_groups()
             .list(AccountGroupListQuery {
+                include_plugin_owned: true,
                 page: 1,
                 page_size: PageSize::new(20).expect("page size"),
                 search: None,
@@ -211,6 +215,7 @@ impl AccountGroupStore for FakeGroupStore {
         Ok(AccountGroupOptionsPage {
             config_revision: Revision::new(1).expect("revision"),
             items: vec![AccountGroupRef {
+                plugin_owned: false,
                 id: group_id(),
                 name: "Primary".to_owned(),
                 color: AccountGroupColor::parse("#2563EBFF").expect("color"),
@@ -343,6 +348,7 @@ impl AccountRuntimeStore for FakeRuntimeStore {
 fn group_record() -> AccountGroupRecord {
     let now = Utc::now();
     AccountGroupRecord {
+        plugin_owned: false,
         allow_image_generation: true,
         fast_mode: FastMode::Default,
         id: group_id(),

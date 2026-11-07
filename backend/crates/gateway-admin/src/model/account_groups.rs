@@ -83,6 +83,7 @@ pub struct AccountGroupMemberFact {
 /// 账号与 Client Key 视图内嵌的轻量分组引用
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccountGroupRef {
+    pub plugin_owned: bool,
     pub id: AccountGroupId,
     pub name: String,
     pub color: AccountGroupColor,
@@ -92,6 +93,7 @@ pub struct AccountGroupRef {
 /// 账号分组列表查询
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccountGroupListQuery {
+    pub include_plugin_owned: bool,
     pub page: u32,
     pub page_size: PageSize,
     pub search: Option<String>,
@@ -101,6 +103,7 @@ pub struct AccountGroupListQuery {
 /// 完整账号分组摘要
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccountGroupRecord {
+    pub plugin_owned: bool,
     pub allow_image_generation: bool,
     pub fast_mode: FastMode,
     pub id: AccountGroupId,

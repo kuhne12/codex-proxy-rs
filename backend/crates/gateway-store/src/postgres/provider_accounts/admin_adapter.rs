@@ -185,8 +185,8 @@ impl PgAdminAccountStore {
         if account_ids.is_empty() {
             return Ok(BTreeMap::new());
         }
-        let rows = sqlx::query_as::<_, (String, String, String, String, bool)>(
-            "select m.provider_account_id, g.id, g.name, g.color, g.enabled
+        let rows = sqlx::query_as::<_, (String, String, String, String, bool, bool)>(
+            "select m.provider_account_id, g.id, g.name, g.color, g.enabled, exists (select 1 from plugin_account_group_resources r where r.group_id = g.id)
              from account_group_accounts m
              join account_groups g on g.id = m.account_group_id
              where m.provider_account_id = any($1::text[])
@@ -202,7 +202,7 @@ impl PgAdminAccountStore {
             )
         })?;
         let mut groups = BTreeMap::<String, Vec<AccountGroupRef>>::new();
-        for (account_id, group_id, name, color, enabled) in rows {
+        for (account_id, group_id, name, color, enabled, plugin_owned) in rows {
             let id = AccountGroupId::new(group_id).map_err(|_| {
                 AdminStoreError::new(
                     AdminStoreErrorKind::Invalid,
@@ -211,6 +211,7 @@ impl PgAdminAccountStore {
                 )
             })?;
             groups.entry(account_id).or_default().push(AccountGroupRef {
+                plugin_owned,
                 id,
                 name,
                 color: gateway_admin::model::account_groups::AccountGroupColor::parse(&color)

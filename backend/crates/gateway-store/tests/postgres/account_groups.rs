@@ -126,6 +126,7 @@ async fn groups_aggregate_cross_provider_members_and_key_bindings_without_multip
 
     let page = groups
         .list_account_groups(AccountGroupListQuery {
+            include_plugin_owned: true,
             page: 1,
             page_size: PageSize::new(20).expect("page size"),
             search: None,
@@ -318,6 +319,7 @@ async fn group_options_should_avoid_aggregate_tables_and_page_filtered_empty_gro
     let first = tokio::time::timeout(
         Duration::from_secs(1),
         groups.list_account_group_options(AccountGroupListQuery {
+            include_plugin_owned: true,
             page: 1,
             page_size: PageSize::new(1).expect("page size"),
             search: Some("pool".to_owned()),
@@ -333,6 +335,7 @@ async fn group_options_should_avoid_aggregate_tables_and_page_filtered_empty_gro
 
     let second = groups
         .list_account_group_options(AccountGroupListQuery {
+            include_plugin_owned: true,
             page: 2,
             page_size: PageSize::new(1).expect("page size"),
             search: Some("POOL".to_owned()),
@@ -344,6 +347,7 @@ async fn group_options_should_avoid_aggregate_tables_and_page_filtered_empty_gro
 
     let disabled = groups
         .list_account_group_options(AccountGroupListQuery {
+            include_plugin_owned: true,
             page: 1,
             page_size: PageSize::new(20).expect("page size"),
             search: None,
@@ -421,6 +425,7 @@ async fn group_costs_should_include_statusless_websocket_but_reject_statusless_h
 
     let page = groups
         .list_account_groups(AccountGroupListQuery {
+            include_plugin_owned: true,
             page: 1,
             page_size: PageSize::new(20).expect("page size"),
             search: None,
@@ -726,6 +731,7 @@ async fn group_costs_follow_current_members_and_pending_source_replacements() {
 async fn load_retained_group_costs(groups: &PgAccountGroupRepository) -> BTreeMap<String, String> {
     groups
         .list_account_groups(AccountGroupListQuery {
+            include_plugin_owned: true,
             page: 1,
             page_size: PageSize::new(20).unwrap(),
             search: None,

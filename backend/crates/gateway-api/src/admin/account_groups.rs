@@ -33,6 +33,7 @@ use super::{
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AccountGroupRefView {
+    pub plugin_owned: bool,
     pub id: String,
     pub name: String,
     pub color: String,
@@ -42,6 +43,7 @@ pub struct AccountGroupRefView {
 impl From<gateway_admin::model::account_groups::AccountGroupRef> for AccountGroupRefView {
     fn from(group: gateway_admin::model::account_groups::AccountGroupRef) -> Self {
         Self {
+            plugin_owned: group.plugin_owned,
             id: group.id.to_string(),
             name: group.name,
             color: group.color.as_str().to_owned(),
@@ -56,6 +58,7 @@ const MAX_PAGE_SIZE: u32 = 200;
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ListAccountGroupsQuery {
+    include_plugin_owned: Option<bool>,
     page: Option<u32>,
     page_size: Option<u32>,
     search: Option<String>,
@@ -80,6 +83,7 @@ impl ListAccountGroupsQuery {
             return Err(WireValidationError::new("search"));
         }
         Ok(AccountGroupListQuery {
+            include_plugin_owned: self.include_plugin_owned.unwrap_or(true),
             page,
             page_size: PageSize::new(
                 u16::try_from(page_size).map_err(|_| WireValidationError::new("pageSize"))?,
@@ -127,6 +131,7 @@ struct AccountGroupIdRequest {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct AccountGroupView {
+    plugin_owned: bool,
     allow_image_generation: bool,
     fast_mode: FastMode,
     id: String,
@@ -171,6 +176,7 @@ struct AccountGroupUsageView {
 impl From<(AccountGroupRecord, crate::time::TimePresenter)> for AccountGroupView {
     fn from((record, time): (AccountGroupRecord, crate::time::TimePresenter)) -> Self {
         Self {
+            plugin_owned: record.plugin_owned,
             id: record.id.to_string(),
             name: record.name,
             description: record.description,

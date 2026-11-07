@@ -139,6 +139,7 @@ pub struct ClientApiKeyRecord {
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct ClientApiKeyGroupRecord {
+    pub plugin_owned: bool,
     pub id: String,
     pub name: String,
     pub color: String,
@@ -465,7 +466,7 @@ impl ClientApiKeyRepository for PgClientApiKeyRepository {
                   from client_api_key_groups kg
                   where kg.client_api_key_id = k.id) as binding_count,
                  (select jsonb_agg(jsonb_build_object(
-                           'id', g.id, 'name', g.name, 'color', g.color, 'enabled', g.enabled
+                           'id', g.id, 'name', g.name, 'color', g.color, 'enabled', g.enabled, 'plugin_owned', exists (select 1 from plugin_account_group_resources r where r.group_id = g.id)
                          ) order by g.id)
                   from client_api_key_groups kg
                   join account_groups g on g.id = kg.account_group_id
@@ -1119,6 +1120,7 @@ fn admin_client_key_record(record: ClientApiKeyRecord) -> AdminStoreResult<Admin
             .into_iter()
             .map(|group| {
                 Ok(AdminAccountGroupRef {
+                    plugin_owned: group.plugin_owned,
                     id: AccountGroupId::new(group.id)
                         .map_err(|_| admin_store_error(ENTITY, invalid("invalid group id")))?,
                     name: group.name,
@@ -1560,6 +1562,7 @@ async fn load_client_key_memberships(
          select requested_keys.key_id,
                 groups.id as group_id, groups.name as group_name, groups.color as group_color,
                 groups.enabled as group_enabled,
+                exists (select 1 from plugin_account_group_resources r where r.group_id = groups.id) as plugin_owned,
                 global_providers.provider_kinds as global_provider_kinds,
                 coalesce(array_agg(distinct accounts.provider_kind order by accounts.provider_kind)
                   filter (where accounts.provider_kind is not null), '{}')
@@ -1596,6 +1599,9 @@ async fn load_client_key_memberships(
                 .entry(key_id.clone())
                 .or_default()
                 .push(ClientApiKeyGroupRecord {
+                    plugin_owned: row.try_get("plugin_owned").map_err(|source| {
+                        invalid("invalid plugin ownership").with_source(source)
+                    })?,
                     id: group_id,
                     name: row.try_get("group_name").map_err(|source| {
                         invalid("invalid client API key group name").with_source(source)

@@ -1813,8 +1813,8 @@ HTTP 返回 `403` 和 `image_generation_disabled`，WebSocket 每个 `response.c
 
 | 方法 | 路由 | 主要 query/body | 说明 |
 | --- | --- | --- | --- |
-| `GET` | `/api/admin/account-groups` | `page`、`pageSize`、`search`、`enabled` | 分页查询分组；返回账号可用性、并发槽位（Redis 不可用时 `usedSlots=null`）及成功请求 USD 用量 |
-| `GET` | `/api/admin/account-groups/options` | `page`、`pageSize`、`search`、`enabled` | 分页查询分组选择项；item 仅返回 `id`、`name`、`color`、`enabled` |
+| `GET` | `/api/admin/account-groups` | `page`、`pageSize`、`search`、`enabled`、`includePluginOwned` | 分页查询分组；返回账号可用性、并发槽位（Redis 不可用时 `usedSlots=null`）及成功请求 USD 用量 |
+| `GET` | `/api/admin/account-groups/options` | `page`、`pageSize`、`search`、`enabled`、`includePluginOwned` | 分页查询分组选择项；item 仅返回 `id`、`name`、`color`、`enabled`、`pluginOwned` |
 | `POST` | `/api/admin/account-groups/create` | `{ name, description, color, fastMode?, allowImageGeneration? }` | 创建空分组；`color` 严格为 `#RRGGBBAA`，返回时统一大写 |
 | `POST` | `/api/admin/account-groups/update` | `{ id, name, description, color, fastMode?, allowImageGeneration? }` | 更新分组信息、Fast 模式和生图权限 |
 | `POST` | `/api/admin/account-groups/enable` | `{ id }` | 启用 |
@@ -1823,6 +1823,10 @@ HTTP 返回 `403` 和 `image_generation_disabled`，WebSocket 每个 `response.c
 
 写入返回 `{ id, record, configRevision }`。删除或已提交变更的展示数据暂不可用时，`record` 为 `null`；
 客户端可重查列表获取展示数据
+
+分组摘要及账号、代理、Key 内嵌的分组引用返回 `pluginOwned`，取自插件资源归属，不按名称判断
+两种列表的 `includePluginOwned` 默认为 `true`，传 `false` 时在分页和计数前排除插件分组
+管理端分组列表和账号标签默认隐藏插件分组，可用“显示插件分组”切换，偏好保存在当前浏览器；隐藏不改变成员、Key 授权或路由
 
 两种列表数据均为 `{ items, page, configRevision }`。完整列表 item 返回 `memberCount`、按 Provider 聚合的
 `providerCounts` 和 `clientKeyCount`。查询分组成员使用账号列表的 `groupId` 筛选，

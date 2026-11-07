@@ -67,6 +67,7 @@ async fn options_route_should_return_only_lightweight_group_fields() {
         json!({
             "id": PRIMARY_GROUP_ID,
             "name": "Alpha routing",
+            "pluginOwned": true,
             "color": "#2563EBFF",
             "enabled": true
         })
@@ -76,6 +77,39 @@ async fn options_route_should_return_only_lightweight_group_fields() {
     assert_eq!(value["data"]["page"]["total"], 1);
     assert_eq!(value["data"]["page"]["totalPages"], 1);
     assert_eq!(value["data"]["configRevision"], 7);
+}
+
+#[tokio::test]
+async fn plugin_group_filter_preserves_default_visibility_and_pagination() {
+    let fixture = authenticated_fixture().await;
+    for endpoint in ["account-groups", "account-groups/options"] {
+        let visible = response_json(
+            request(
+                router(&fixture),
+                Method::GET,
+                &format!("/api/admin/{endpoint}?pageSize=1"),
+                None,
+                true,
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(visible["data"]["page"]["total"], 2);
+        assert_eq!(visible["data"]["items"][0]["pluginOwned"], true);
+        let hidden = response_json(
+            request(
+                router(&fixture),
+                Method::GET,
+                &format!("/api/admin/{endpoint}?pageSize=1&includePluginOwned=false"),
+                None,
+                true,
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(hidden["data"]["page"]["total"], 1);
+        assert_eq!(hidden["data"]["items"][0]["name"], "Beta routing");
+    }
 }
 
 #[tokio::test]

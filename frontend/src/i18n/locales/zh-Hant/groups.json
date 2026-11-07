@@ -21,6 +21,7 @@
       "batchDeletionFailed": "批量刪除失敗"
     },
     "filters": {
+      "showPluginGroups": "顯示插件分組",
       "searchAccountGroup": "搜索賬號分組",
       "searchGroupName": "搜索分組名稱",
       "deleteSelected": "刪除 ({count})",

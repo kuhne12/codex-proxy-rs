@@ -1,9 +1,9 @@
 <script setup lang="ts">
 import type { Account } from '@/api'
-
 import { useTableColumns, ZCard, ZCheckbox, ZConfirmDialog, ZPageHeader, ZPagination, ZTable, ZTableColumnSettings } from '@codex-proxy/ui'
 
 import { ChevronDown } from '@lucide/vue'
+
 import { ref, shallowRef } from 'vue'
 import { useI18n } from 'vue-i18n'
 import AccountPlanBadge from '@/components/account/AccountPlanBadge.vue'
@@ -11,6 +11,7 @@ import AccountGroupMarks from '@/components/AccountGroupMarks.vue'
 import LastUsedAtCell from '@/components/LastUsedAtCell.vue'
 import ProviderIconGroup from '@/components/ProviderIconGroup.vue'
 import { useAccountGroupCatalog } from '@/composables/useAccountGroupCatalog'
+import { useUiStore } from '@/stores/modules/ui'
 import AccountCreateModal from './components/account-create-modal/index.vue'
 import AccountImportTasks from './components/account-import-tasks/index.vue'
 import AccountQuotaPanel from './components/account-quota-panel/index.vue'
@@ -210,6 +211,7 @@ const {
   reloadAccounts: loadAccounts,
   reloadGroups: loadGroups,
 })
+const ui = useUiStore()
 </script>
 
 <template>
@@ -336,7 +338,7 @@ const {
 
             <template #groups="{ row }">
               <div class="flex w-full justify-center">
-                <AccountGroupMarks :groups="row.groups" />
+                <AccountGroupMarks :groups="row.groups" :hide-plugin-groups="!ui.showPluginGroups" />
               </div>
             </template>
 

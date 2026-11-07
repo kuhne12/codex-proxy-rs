@@ -197,7 +197,7 @@ impl AccountGroupStore for PgAccountGroupRepository {
             .map_err(|error| admin_store_error(ENTITY, error))?;
         let offset = u64::from(query.page.saturating_sub(1)) * u64::from(query.page_size.get());
         let mut statement = QueryBuilder::<Postgres>::new(
-            "select g.id, g.name, g.color, g.enabled from account_groups g where true",
+            "select g.id, g.name, g.color, g.enabled, exists (select 1 from plugin_account_group_resources r where r.group_id = g.id) as plugin_owned from account_groups g where true",
         );
         push_group_filter(&mut statement, &query);
         statement.push(" order by g.created_at desc, g.id desc limit ");
@@ -471,6 +471,7 @@ impl AccountGroupStore for PgAccountGroupRepository {
 fn group_select() -> QueryBuilder<Postgres> {
     QueryBuilder::new(
         "select g.id, g.name, g.description, g.color, g.enabled, g.fast_mode, g.allow_image_generation, g.created_at, g.updated_at,
+                exists (select 1 from plugin_account_group_resources r where r.group_id = g.id) as plugin_owned,
                 coalesce(members.member_count, 0)::bigint as member_count,
                 coalesce(keys.client_key_count, 0)::bigint as client_key_count,
                 coalesce(members.provider_counts, '{}'::jsonb) as provider_counts
@@ -497,6 +498,9 @@ fn group_select() -> QueryBuilder<Postgres> {
 }
 
 fn push_group_filter(statement: &mut QueryBuilder<Postgres>, query: &AccountGroupListQuery) {
+    if !query.include_plugin_owned {
+        statement.push(" and not exists (select 1 from plugin_account_group_resources r where r.group_id = g.id)");
+    }
     if let Some(search) = &query.search {
         statement.push(" and lower(g.name) like ");
         statement.push_bind(format!("%{}%", search.to_lowercase()));
@@ -510,14 +514,7 @@ fn push_group_filter(statement: &mut QueryBuilder<Postgres>, query: &AccountGrou
 async fn count_groups(pool: &PgPool, query: &AccountGroupListQuery) -> StoreResult<u64> {
     let mut statement =
         QueryBuilder::<Postgres>::new("select count(*)::bigint from account_groups g where true");
-    if let Some(search) = &query.search {
-        statement.push(" and lower(g.name) like ");
-        statement.push_bind(format!("%{}%", search.to_lowercase()));
-    }
-    if let Some(enabled) = query.enabled {
-        statement.push(" and g.enabled = ");
-        statement.push_bind(enabled);
-    }
+    push_group_filter(&mut statement, query);
     let count = statement
         .build_query_scalar::<i64>()
         .fetch_one(pool)
@@ -548,6 +545,9 @@ fn group_record(row: &sqlx::postgres::PgRow) -> StoreResult<AccountGroupRecord> 
     let provider_counts = serde_json::from_value::<BTreeMap<String, u64>>(provider_counts)
         .map_err(|source| invalid("invalid provider counts").with_source(source))?;
     Ok(AccountGroupRecord {
+        plugin_owned: row
+            .try_get("plugin_owned")
+            .map_err(|source| invalid("invalid plugin ownership").with_source(source))?,
         allow_image_generation: row
             .try_get("allow_image_generation")
             .map_err(|source| invalid("invalid image generation policy").with_source(source))?,
@@ -605,6 +605,9 @@ fn group_record(row: &sqlx::postgres::PgRow) -> StoreResult<AccountGroupRecord> 
 
 fn group_ref(row: &sqlx::postgres::PgRow) -> StoreResult<AccountGroupRef> {
     Ok(AccountGroupRef {
+        plugin_owned: row
+            .try_get("plugin_owned")
+            .map_err(|source| invalid("invalid plugin ownership").with_source(source))?,
         id: AccountGroupId::new(
             row.try_get::<String, _>("id")
                 .map_err(|source| invalid("invalid id").with_source(source))?,

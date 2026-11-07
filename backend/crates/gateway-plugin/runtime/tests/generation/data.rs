@@ -37,6 +37,7 @@ fn account() -> AccountRecord {
         id: "acct_facts".into(),
         provider_kind: ProviderKind::new("openai").unwrap(),
         groups: vec![gateway_admin::model::account_groups::AccountGroupRef {
+            plugin_owned: false,
             id: gateway_core::routing::AccountGroupId::new("grp_11111111111111111111111111111111")
                 .unwrap(),
             name: "private group label".into(),

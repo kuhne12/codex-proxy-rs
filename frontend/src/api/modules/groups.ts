@@ -4,6 +4,7 @@ import request from '../request'
 export type FastMode = 'default' | 'enabled' | 'disabled'
 
 export interface AccountGroupRef {
+  pluginOwned: boolean
   id: string
   name: string
   color: string
@@ -68,6 +69,7 @@ export interface AccountGroupMutationResponse {
 }
 
 interface AccountGroupListParams {
+  includePluginOwned?: boolean
   page: number
   pageSize: number
   search?: string

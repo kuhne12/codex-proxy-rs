@@ -1,4 +1,4 @@
-//! 验证插件实例的精确授权、版本替换与配置和敏感值原子提交
+//! 验证插件实例授权、版本配置、自有资源归属与敏感值原子提交
 
 use std::collections::BTreeMap;
 
@@ -42,6 +42,124 @@ fn instance(digest: String) -> PluginInstance {
         bindings: vec![],
         revision: Revision::new(1).unwrap(),
     }
+}
+
+#[tokio::test]
+async fn plugin_group_visibility_uses_ownership_before_pagination() {
+    use gateway_admin::{
+        model::{
+            PageSize,
+            account_groups::{AccountGroupColor, AccountGroupListQuery, NewAccountGroup},
+            plugin_resources::PluginResourceOwner,
+        },
+        ports::{plugin_resources::PluginResourceStore, store::AccountGroupStore},
+    };
+    use gateway_core::{account::FastMode, routing::AccountGroupId};
+    use gateway_store::postgres::PgAccountGroupRepository;
+
+    let Some(database) = TestDatabase::create("plugin_group_visibility").await else {
+        return;
+    };
+    initialize_revision(&database).await;
+    let store = PgPluginStore::new(database.pool.clone());
+    let installed = store
+        .install_artifact(
+            artifact('a', &["linux-x86_64"]),
+            PluginSource::Upload,
+            &context(),
+        )
+        .await
+        .unwrap();
+    let accepted = store
+        .accept_artifact(&installed.artifact.metadata.sha256, &context())
+        .await
+        .unwrap();
+    let mut candidate = instance(installed.artifact.metadata.sha256);
+    candidate.enabled = true;
+    let saved = store
+        .save_instance(candidate, accepted.config_revision, &context())
+        .await
+        .unwrap();
+    let owner = PluginResourceOwner {
+        instance_id: saved.instance.id,
+        artifact_sha256: saved.instance.artifact_sha256,
+        revision: saved.instance.revision,
+    };
+    let groups = PgAccountGroupRepository::new(
+        database.pool.clone(),
+        super::super::observability_query_budget(),
+    );
+    let command = |id: &str, name: &str| NewAccountGroup {
+        id: AccountGroupId::new(id).unwrap(),
+        name: name.into(),
+        description: None,
+        color: AccountGroupColor::parse("#2563EBFF").unwrap(),
+        fast_mode: FastMode::Default,
+        allow_image_generation: true,
+    };
+    // 普通组即使与插件默认名称相同也必须保留；插件组改名不能改变归属
+    groups
+        .create_account_group(
+            command("grp_00000000000000000000000000000001", "糖果自检"),
+            &context(),
+        )
+        .await
+        .unwrap();
+    store
+        .ensure_group(
+            &owner,
+            "evaluation".into(),
+            command("grp_00000000000000000000000000000002", "糖果自检插件"),
+            &context(),
+        )
+        .await
+        .unwrap();
+    sqlx::query(
+        "update account_groups set name = 'Renamed evaluation' where id = 'grp_00000000000000000000000000000002'",
+    )
+    .execute(&database.pool)
+    .await
+    .unwrap();
+    let query = |include_plugin_owned, page| AccountGroupListQuery {
+        include_plugin_owned,
+        page,
+        page_size: PageSize::new(1).unwrap(),
+        search: None,
+        enabled: None,
+    };
+    let all = groups.list_account_groups(query(true, 1)).await.unwrap();
+    assert_eq!(all.total, 2);
+    assert!(all.items[0].plugin_owned);
+    for page in [1, 2] {
+        let visible = groups
+            .list_account_groups(query(false, page))
+            .await
+            .unwrap();
+        let options = groups
+            .list_account_group_options(query(false, page))
+            .await
+            .unwrap();
+        assert_eq!(visible.total, 1);
+        assert_eq!(options.total, 1);
+        assert_eq!(visible.items.len(), usize::from(page == 1));
+        assert_eq!(options.items.len(), visible.items.len());
+        if page == 1 {
+            assert_eq!(visible.items[0].name, "糖果自检");
+            assert!(!visible.items[0].plugin_owned);
+            assert!(!options.items[0].plugin_owned);
+        }
+    }
+    // 解除归属后，保留下来的分组重新按普通组展示
+    sqlx::query(
+        "delete from plugin_account_group_resources where group_id = 'grp_00000000000000000000000000000002'",
+    )
+    .execute(&database.pool)
+    .await
+    .unwrap();
+    let visible = groups.list_account_groups(query(false, 1)).await.unwrap();
+    assert_eq!(visible.total, 2);
+    assert!(!visible.items[0].plugin_owned);
+    database.close().await;
 }
 
 #[tokio::test]

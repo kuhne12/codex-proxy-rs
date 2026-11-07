@@ -740,6 +740,7 @@ impl MemoryAccountGroupStore {
             (
                 primary_id.clone(),
                 AccountGroupRecord {
+                    plugin_owned: true,
                     allow_image_generation: true,
                     fast_mode: FastMode::Default,
                     id: primary_id,
@@ -763,6 +764,7 @@ impl MemoryAccountGroupStore {
             (
                 secondary_id.clone(),
                 AccountGroupRecord {
+                    plugin_owned: false,
                     allow_image_generation: true,
                     fast_mode: FastMode::Default,
                     id: secondary_id,
@@ -801,6 +803,7 @@ impl AccountGroupStore for MemoryAccountGroupStore {
         let mut matching = state
             .groups
             .values()
+            .filter(|record| query.include_plugin_owned || !record.plugin_owned)
             .filter(|record| {
                 query
                     .enabled
@@ -842,6 +845,7 @@ impl AccountGroupStore for MemoryAccountGroupStore {
         let mut matching = state
             .groups
             .values()
+            .filter(|record| query.include_plugin_owned || !record.plugin_owned)
             .filter(|record| {
                 query
                     .enabled
@@ -853,6 +857,7 @@ impl AccountGroupStore for MemoryAccountGroupStore {
                     .is_none_or(|search| record.name.to_lowercase().contains(search))
             })
             .map(|record| AccountGroupRef {
+                plugin_owned: record.plugin_owned,
                 id: record.id.clone(),
                 name: record.name.clone(),
                 color: record.color.clone(),
@@ -924,6 +929,7 @@ impl AccountGroupStore for MemoryAccountGroupStore {
         let mut state = self.state.lock().expect("account groups");
         let now = Utc::now();
         let record = AccountGroupRecord {
+            plugin_owned: false,
             allow_image_generation: command.allow_image_generation,
             fast_mode: command.fast_mode,
             id: command.id.clone(),

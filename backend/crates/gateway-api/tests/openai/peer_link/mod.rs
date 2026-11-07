@@ -56,6 +56,7 @@ async fn fixture(sharing: ClientPeerSharing, plaintext: &str) -> (AdminTestFixtu
     let fixture = key_fixture().await;
     let now = Utc::now();
     let group = AccountGroupRef {
+        plugin_owned: false,
         id: AccountGroupId::new(format!("grp_{}", "1".repeat(32))).unwrap(),
         name: "private-group-sentinel".into(),
         color: AccountGroupColor::parse("#2563EBFF").unwrap(),
