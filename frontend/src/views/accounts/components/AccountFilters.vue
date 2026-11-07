@@ -4,7 +4,7 @@ import type { AccountGroupRef } from '@/api'
 import { ZButton, ZCheckbox, ZIconButton, ZInput, ZMenuItem, ZPopover, ZSelect } from '@codex-proxy/ui'
 import { Download, ListTodo, MoreHorizontal, Pencil, Search, Trash2, Upload } from '@lucide/vue'
 
-import { computed } from 'vue'
+import { computed, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import ProviderFilter from '@/components/ProviderFilter.vue'
 import { useUiStore } from '@/stores/modules/ui'
@@ -45,13 +45,18 @@ const groupOptions = computed(() => [
     label: t('accounts.filters.ungroupedAccounts'),
     value: 'ungrouped',
   },
-  ...props.groups.map(group => ({
+  ...props.groups.filter(group => ui.showPluginGroups || !group.pluginOwned).map(group => ({
     label: group.enabled
       ? group.name
       : t('accounts.filters.disabled', { name: group.name }),
     value: group.id,
   })),
 ])
+
+watch(() => ui.showPluginGroups, (show) => {
+  if (!show && props.groups.some(item => item.id === group.value && item.pluginOwned))
+    group.value = ''
+})
 </script>
 
 <template>
