@@ -10,6 +10,7 @@ import { computed, useTemplateRef, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import AccountPlanBadge from '@/components/account/AccountPlanBadge.vue'
 import ProviderIconGroup from '@/components/ProviderIconGroup.vue'
+import { useUiStore } from '@/stores/modules/ui'
 import { useAccountApiKeyFormRules } from '../composables/useAccountApiKeyFormRules'
 import { useAccountSettingsFormRules } from '../composables/useAccountSettingsFormRules'
 import { isOpenAiApiKeyAccount, isOpenAiOAuthAccount } from '../utils/upstreamApiKey'
@@ -31,6 +32,8 @@ const emit = defineEmits<{
 }>()
 
 const { t } = useI18n({ useScope: 'global' })
+const ui = useUiStore()
+const visibleGroups = computed(() => props.groups.filter(group => ui.showPluginGroups || !group.pluginOwned))
 
 const open = defineModel<boolean>({ required: true })
 const apiKey = defineModel<ApiKeyAccountForm>('apiKey', { required: true })
@@ -117,7 +120,7 @@ async function requestSave() {
         v-model:selected-group-ids="selectedGroupIds"
         v-model:proxy-mode="proxyMode"
         v-model:proxy-id="proxyId"
-        :groups="groups"
+        :groups="visibleGroups"
         :groups-loading="groupsLoading"
         :disabled="saving"
         :show-scheduling="false"

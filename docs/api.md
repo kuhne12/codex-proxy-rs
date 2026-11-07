@@ -1826,7 +1826,7 @@ HTTP 返回 `403` 和 `image_generation_disabled`，WebSocket 每个 `response.c
 
 分组摘要及账号、代理、Key 内嵌的分组引用返回 `pluginOwned`，取自插件资源归属，不按名称判断
 两种列表的 `includePluginOwned` 默认为 `true`，传 `false` 时在分页和计数前排除插件分组
-管理端分组列表、账号分组筛选和账号标签默认隐藏插件分组，可用“显示插件分组”切换，偏好保存在当前浏览器；隐藏不改变成员、Key 授权或路由
+管理端分组列表、账号分组筛选、账号标签和单账号编辑分组默认隐藏插件分组，可用“显示插件分组”切换，偏好保存在当前浏览器；隐藏不改变成员、Key 授权或路由
 
 两种列表数据均为 `{ items, page, configRevision }`。完整列表 item 返回 `memberCount`、按 Provider 聚合的
 `providerCounts` 和 `clientKeyCount`。查询分组成员使用账号列表的 `groupId` 筛选，
