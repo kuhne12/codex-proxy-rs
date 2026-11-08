@@ -99,6 +99,7 @@ pub struct ClientKeyCursor {
 /// Client Key 列表查询
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientKeyListQuery {
+    pub include_plugin_owned: bool,
     pub cursor: Option<ClientKeyCursor>,
     pub page_size: ClientKeyPageSize,
     pub search: Option<String>,

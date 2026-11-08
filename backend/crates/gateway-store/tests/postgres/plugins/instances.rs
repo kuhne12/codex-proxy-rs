@@ -45,11 +45,15 @@ fn instance(digest: String) -> PluginInstance {
 }
 
 #[tokio::test]
-async fn plugin_group_visibility_uses_ownership_before_pagination() {
+async fn plugin_resource_visibility_uses_ownership_before_pagination() {
     use gateway_admin::{
         model::{
             PageSize,
             account_groups::{AccountGroupColor, AccountGroupListQuery, NewAccountGroup},
+            client_keys::{
+                ClientKeyListQuery, ClientKeyPageSize, ClientKeySort, ClientKeySortField,
+                NewClientKey, SortDirection,
+            },
             plugin_resources::PluginResourceOwner,
         },
         ports::{plugin_resources::PluginResourceStore, store::AccountGroupStore},
@@ -149,6 +153,89 @@ async fn plugin_group_visibility_uses_ownership_before_pagination() {
             assert!(!options.items[0].plugin_owned);
         }
     }
+    let keys = PgAdminClientKeyStore::new(database.pool.clone());
+    let key_command = |id: &str, name: &str| NewClientKey {
+        peer_sharing: Default::default(),
+        request_profile_overrides: Default::default(),
+        id: ClientApiKeyId::new(id).unwrap(),
+        name: name.into(),
+        label: None,
+        group_ids: vec![AccountGroupId::new("grp_00000000000000000000000000000002").unwrap()],
+        limits: gateway_core::policy::RateLimits::unlimited(),
+        budget: Default::default(),
+        plaintext: format!("synthetic-{id}"),
+    };
+    // 绑定插件组的普通密钥仍展示，改名后的插件密钥仍按真实归属隐藏
+    for (id, name) in [
+        ("key_regular_a", "B 糖果自检"),
+        ("key_regular_b", "C 普通密钥"),
+    ] {
+        keys.create_client_key(key_command(id, name), &context())
+            .await
+            .unwrap();
+    }
+    store
+        .ensure_key(
+            &owner,
+            "evaluation".into(),
+            vec!["evaluation".into()],
+            key_command("key_plugin", "Original plugin key"),
+            &context(),
+        )
+        .await
+        .unwrap();
+    sqlx::query("update client_api_keys set name = 'A Renamed key' where id = 'key_plugin'")
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    let key_query = |include_plugin_owned, cursor, search| ClientKeyListQuery {
+        include_plugin_owned,
+        cursor,
+        page_size: ClientKeyPageSize::new(1).unwrap(),
+        search,
+        sort: ClientKeySort {
+            field: ClientKeySortField::Name,
+            direction: SortDirection::Asc,
+        },
+    };
+    let all_keys = keys
+        .list_client_keys(key_query(true, None, None))
+        .await
+        .unwrap();
+    assert_eq!(all_keys.total, 3);
+    assert_eq!(all_keys.items[0].id.as_str(), "key_plugin");
+    let first = keys
+        .list_client_keys(key_query(false, None, None))
+        .await
+        .unwrap();
+    assert_eq!(first.total, 2);
+    assert_eq!(first.items[0].id.as_str(), "key_regular_a");
+    assert!(first.next_cursor.is_some());
+    let second = keys
+        .list_client_keys(key_query(false, first.next_cursor, None))
+        .await
+        .unwrap();
+    assert_eq!(second.total, 2);
+    assert_eq!(second.items[0].id.as_str(), "key_regular_b");
+    assert!(second.next_cursor.is_none());
+    for (include, expected) in [(true, 1), (false, 0)] {
+        let searched = keys
+            .list_client_keys(key_query(include, None, Some("Renamed".into())))
+            .await
+            .unwrap();
+        assert_eq!(searched.total, expected);
+        assert_eq!(searched.items.len() as u64, expected);
+    }
+    sqlx::query("delete from plugin_client_api_key_resources where key_id = 'key_plugin'")
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    let detached = keys
+        .list_client_keys(key_query(false, None, None))
+        .await
+        .unwrap();
+    assert_eq!(detached.total, 3);
+    assert_eq!(detached.items[0].id.as_str(), "key_plugin");
     // 解除归属后，保留下来的分组重新按普通组展示
     sqlx::query(
         "delete from plugin_account_group_resources where group_id = 'grp_00000000000000000000000000000002'",

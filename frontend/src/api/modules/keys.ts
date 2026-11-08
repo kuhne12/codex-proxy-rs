@@ -69,6 +69,7 @@ export interface ApiKeyMutationResponse {
 
 // 请求参数类型：仅定义 API 边界的形状，调用方不依赖显式声明。
 interface ApiKeyListParams {
+  includePluginOwned?: boolean
   cursor?: string
   limit: number
   search?: string

@@ -420,6 +420,7 @@ async fn client_key_search_matches_names_and_labels_but_never_credential_values(
     ] {
         let page = repository
             .list_client_api_keys(ClientApiKeyListQuery {
+                include_plugin_owned: true,
                 cursor: None,
                 page_size: 10,
                 search: Some(search.to_owned()),
@@ -462,6 +463,7 @@ async fn client_key_list_uses_safe_keyset_search_and_filtered_total() {
     let repository = PgClientApiKeyRepository::new(database.pool.clone());
     let first = repository
         .list_client_api_keys(ClientApiKeyListQuery {
+            include_plugin_owned: true,
             cursor: None,
             page_size: 2,
             search: None,
@@ -474,6 +476,7 @@ async fn client_key_list_uses_safe_keyset_search_and_filtered_total() {
     assert!(first.next_cursor.is_some());
     let second = repository
         .list_client_api_keys(ClientApiKeyListQuery {
+            include_plugin_owned: true,
             cursor: first.next_cursor,
             page_size: 2,
             search: None,
@@ -486,6 +489,7 @@ async fn client_key_list_uses_safe_keyset_search_and_filtered_total() {
 
     let searched = repository
         .list_client_api_keys(ClientApiKeyListQuery {
+            include_plugin_owned: true,
             cursor: None,
             page_size: 10,
             search: Some("needle".to_owned()),
@@ -504,6 +508,7 @@ fn client_key_cursor_is_bound_to_one_sort_contract() {
     let created_sort = ClientApiKeySort::default();
     assert!(
         ClientApiKeyListQuery {
+            include_plugin_owned: true,
             cursor: None,
             page_size: u16::MAX,
             search: None,
@@ -519,6 +524,7 @@ fn client_key_cursor_is_bound_to_one_sort_contract() {
     )
     .expect("valid cursor");
     let query = ClientApiKeyListQuery {
+        include_plugin_owned: true,
         cursor: Some(cursor),
         page_size: 10,
         search: None,
@@ -545,6 +551,7 @@ async fn admin_client_key_adapter_should_preserve_the_full_nonzero_u16_page_size
     };
     let page = PgAdminClientKeyStore::new(database.pool.clone())
         .list_client_keys(AdminClientKeyListQuery {
+            include_plugin_owned: true,
             cursor: None,
             page_size: ClientKeyPageSize::new(u16::MAX).expect("maximum page size"),
             search: None,
@@ -649,6 +656,7 @@ async fn client_key_database_sort_is_stable_and_keeps_null_last_used_at_last() {
         loop {
             let page = repository
                 .list_client_api_keys(ClientApiKeyListQuery {
+                    include_plugin_owned: true,
                     cursor,
                     page_size: 1,
                     search: None,

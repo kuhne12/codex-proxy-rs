@@ -5,9 +5,11 @@ import { computed, onMounted, shallowRef, watch } from 'vue'
 import { getApiKeys } from '@/api'
 import { useRequestState } from '@/composables/useRequestState'
 import { useTableSort } from '@/composables/useTableSort'
+import { useUiStore } from '@/stores/modules/ui'
 import { apiKeyColumns } from '../constants'
 
 export function useApiKeysQuery() {
+  const ui = useUiStore()
   const searchQuery = shallowRef('')
   const sort = useTableSort(apiKeyColumns, 'api-keys')
   const page = shallowRef(1)
@@ -45,6 +47,7 @@ export function useApiKeysQuery() {
 
   async function fetchPage(cursor: string | undefined, limit: number, search: string | undefined, signal?: AbortSignal) {
     return getApiKeys({
+      includePluginOwned: ui.showPluginKeys,
       cursor,
       limit,
       search,
@@ -127,6 +130,10 @@ export function useApiKeysQuery() {
       void reloadFromStart()
     }, 250)
     onCleanup(() => clearTimeout(timer))
+  })
+
+  watch(() => ui.showPluginKeys, () => {
+    void reloadFromStart()
   })
 
   onMounted(() => {

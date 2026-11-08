@@ -1,9 +1,10 @@
 <script setup lang="ts">
-import { ZButton, ZInput } from '@codex-proxy/ui'
+import { ZButton, ZCheckbox, ZInput } from '@codex-proxy/ui'
 
 import { Plus, Search, Trash2 } from '@lucide/vue'
 
 import { useI18n } from 'vue-i18n'
+import { useUiStore } from '@/stores/modules/ui'
 
 defineProps<{
   batchDeleting: boolean
@@ -16,6 +17,7 @@ const emit = defineEmits<{
 }>()
 
 const { t } = useI18n({ useScope: 'global' })
+const ui = useUiStore()
 
 const search = defineModel<string>('search', { required: true })
 </script>
@@ -33,6 +35,8 @@ const search = defineModel<string>('search', { required: true })
         </template>
       </ZInput>
     </div>
+
+    <ZCheckbox v-model="ui.showPluginKeys" :label="t('keys.filters.showPluginKeys')" />
 
     <div class="flex max-w-full shrink-0 flex-wrap items-center justify-end gap-2 md:ml-auto">
       <ZButton

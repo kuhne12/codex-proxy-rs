@@ -246,6 +246,7 @@ impl ClientApiKeyCursor {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientApiKeyListQuery {
+    pub include_plugin_owned: bool,
     pub cursor: Option<ClientApiKeyCursor>,
     pub page_size: u16,
     pub search: Option<String>,
@@ -385,7 +386,7 @@ impl ClientApiKeyRepository for PgClientApiKeyRepository {
         query: ClientApiKeyListQuery,
     ) -> StoreResult<ClientApiKeyPage> {
         query.validate()?;
-        let total = count_client_api_keys(&self.pool, query.search.as_deref()).await?;
+        let total = count_client_api_keys(&self.pool, &query).await?;
         let mut statement = QueryBuilder::<Postgres>::new(
             "select k.id, k.name, k.label, k.peer_sharing_json, k.provider_request_profiles_json as request_profile_overrides,
                     left(k.key, least(10, length(k.key) / 2)) as prefix, k.enabled,
@@ -394,7 +395,7 @@ impl ClientApiKeyRepository for PgClientApiKeyRepository {
              from client_api_keys k
              where true",
         );
-        push_client_key_search(&mut statement, query.search.as_deref());
+        push_client_key_filters(&mut statement, &query);
         if let Some(cursor) = &query.cursor {
             push_client_key_cursor(&mut statement, cursor);
         }
@@ -1041,6 +1042,7 @@ fn store_client_key_query(
 ) -> AdminStoreResult<ClientApiKeyListQuery> {
     let sort = store_client_key_sort(query.sort);
     Ok(ClientApiKeyListQuery {
+        include_plugin_owned: query.include_plugin_owned,
         cursor: query
             .cursor
             .map(|cursor| store_client_key_cursor(cursor, sort))
@@ -1514,10 +1516,10 @@ fn client_record_from_row(row: &sqlx::postgres::PgRow) -> StoreResult<ClientApiK
     )
 }
 
-async fn count_client_api_keys(pool: &PgPool, search: Option<&str>) -> StoreResult<u64> {
+async fn count_client_api_keys(pool: &PgPool, query: &ClientApiKeyListQuery) -> StoreResult<u64> {
     let mut statement =
-        QueryBuilder::<Postgres>::new("select count(*)::bigint from client_api_keys where true");
-    push_client_key_search(&mut statement, search);
+        QueryBuilder::<Postgres>::new("select count(*)::bigint from client_api_keys k where true");
+    push_client_key_filters(&mut statement, query);
     let count = statement
         .build_query_scalar::<i64>()
         .fetch_one(pool)
@@ -1526,8 +1528,13 @@ async fn count_client_api_keys(pool: &PgPool, search: Option<&str>) -> StoreResu
     to_u64(count)
 }
 
-fn push_client_key_search(statement: &mut QueryBuilder<Postgres>, search: Option<&str>) {
-    if let Some(search) = search {
+fn push_client_key_filters(statement: &mut QueryBuilder<Postgres>, query: &ClientApiKeyListQuery) {
+    if !query.include_plugin_owned {
+        statement.push(
+            " and not exists (select 1 from plugin_client_api_key_resources r where r.key_id = k.id)",
+        );
+    }
+    if let Some(search) = query.search.as_deref() {
         let pattern = crate::postgres::literal_contains_pattern(&search.to_lowercase());
         statement.push(" and (lower(name) like ");
         statement.push_bind(pattern.clone());

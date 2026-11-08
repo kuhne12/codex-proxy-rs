@@ -48,6 +48,7 @@
       "iHaveSaved": "I have saved"
     },
     "filters": {
+      "showPluginKeys": "Show plugin keys",
       "apiKeyFilteringAndOperations": "API key filtering and operations",
       "searchPlaceholder": "Search by name or label",
       "searchLabel": "Search API keys by name or label",

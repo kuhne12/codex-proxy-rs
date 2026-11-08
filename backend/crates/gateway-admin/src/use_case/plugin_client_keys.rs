@@ -91,6 +91,7 @@ impl PluginClientKeyAccess for DefaultPluginClientKeyAccess {
         let page = self
             .service
             .list(ClientKeyListQuery {
+                include_plugin_owned: true,
                 cursor: query.cursor.map(|cursor| ClientKeyCursor {
                     sort,
                     value: ClientKeyCursorValue::Name(cursor.name),

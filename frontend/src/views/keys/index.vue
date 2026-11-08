@@ -10,6 +10,7 @@ import ClientImportModal from '@/components/ClientImportModal.vue'
 import LastUsedAtCell from '@/components/LastUsedAtCell.vue'
 import { useAccountGroupCatalog } from '@/composables/useAccountGroupCatalog'
 import { usePageSelection } from '@/composables/usePageSelection'
+import { useUiStore } from '@/stores/modules/ui'
 import ApiKeyActions from './components/ApiKeyActions.vue'
 import ApiKeyBudgetCell from './components/ApiKeyBudgetCell.vue'
 import ApiKeyBudgetResetModal from './components/ApiKeyBudgetResetModal.vue'
@@ -28,7 +29,12 @@ import { apiKeyColumns } from './constants'
 
 const { t } = useI18n({ useScope: 'global' })
 
+const ui = useUiStore()
 const selectedIds = ref<Set<string>>(new Set())
+
+watch(() => ui.showPluginKeys, () => {
+  selectedIds.value = new Set()
+})
 const showBudgetResetModal = shallowRef(false)
 const resettingKey = shallowRef<ApiKey | null>(null)
 

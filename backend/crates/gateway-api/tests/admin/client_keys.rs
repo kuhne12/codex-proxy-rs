@@ -318,6 +318,25 @@ fn client_key_queries_should_reject_unknown_zero_and_oversized_fields() {
 }
 
 #[test]
+fn client_key_plugin_visibility_defaults_to_included_and_accepts_explicit_filter() {
+    for (payload, expected) in [
+        (json!({}), true),
+        (json!({"includePluginOwned": true}), true),
+        (json!({"includePluginOwned": false}), false),
+    ] {
+        let command = serde_json::from_value::<ListClientKeysQuery>(payload)
+            .unwrap()
+            .into_command()
+            .unwrap();
+        assert_eq!(command.include_plugin_owned, expected);
+    }
+    assert!(
+        serde_json::from_value::<ListClientKeysQuery>(json!({"includePluginOwned": "invalid"}))
+            .is_err()
+    );
+}
+
+#[test]
 fn client_key_name_search_does_not_interpret_names_as_credentials() {
     let name = format!("sk_{}", "a".repeat(43));
     let command = serde_json::from_value::<ListClientKeysQuery>(json!({ "search": name }))

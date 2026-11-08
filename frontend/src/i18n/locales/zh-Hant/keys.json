@@ -48,6 +48,7 @@
       "iHaveSaved": "我已保存"
     },
     "filters": {
+      "showPluginKeys": "顯示插件金鑰",
       "apiKeyFilteringAndOperations": "API密鑰篩選與操作",
       "searchPlaceholder": "搜索名稱或標籤",
       "searchLabel": "搜索 API密鑰名稱或標籤",

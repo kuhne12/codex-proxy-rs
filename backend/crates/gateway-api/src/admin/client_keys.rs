@@ -56,6 +56,7 @@ fn parse_budget(
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ListClientKeysQuery {
+    include_plugin_owned: Option<bool>,
     cursor: Option<String>,
     limit: Option<u16>,
     search: Option<String>,
@@ -96,6 +97,7 @@ impl ListClientKeysQuery {
         let page_size = ClientKeyPageSize::new(self.limit.unwrap_or(DEFAULT_PAGE_SIZE))
             .map_err(|_| WireValidationError::new("limit"))?;
         Ok(ClientKeyListQuery {
+            include_plugin_owned: self.include_plugin_owned.unwrap_or(true),
             cursor,
             page_size,
             search: search.filter(|search| !search.is_empty()),
