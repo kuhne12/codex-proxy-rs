@@ -266,6 +266,7 @@ impl FakeProviderAdmin {
                 plan_type: account.plan_type.clone(),
                 preserve_profile: false,
                 preserve_credential_state: false,
+                preserve_access_token_expiry: false,
                 provider_material: document(),
                 has_refresh_token: account.has_refresh_token,
                 access_token_expires_at: account
@@ -714,6 +715,7 @@ impl FakeAccountStore {
 
     fn page_item(account: AccountRecord) -> AccountPageItem {
         let facts = AccountStatusFacts {
+            quota_paused: false,
             enabled: account.enabled,
             credential_state: account.credential_state,
             access_token_expires_at: account.access_token_expires_at.map(Into::into),
@@ -788,6 +790,7 @@ impl AccountStore for FakeAccountStore {
             summary: AccountSummary {
                 total,
                 normal: 1,
+                quota_paused: 0,
                 quota_exhausted: 0,
                 rate_limited: 0,
                 disabled: 0,
@@ -841,6 +844,17 @@ impl AccountStore for FakeAccountStore {
             .lock()
             .expect("quota window usage")
             .clone())
+    }
+
+    async fn quota_documents(
+        &self,
+        _: &gateway_core::account::ProviderAccountId,
+        _: &gateway_core::routing::ProviderKind,
+        _: chrono::DateTime<chrono::Utc>,
+        _: gateway_admin::model::observability::TimeRange,
+        _: Option<&gateway_admin::model::quota_history::QuotaHistoryCursor>,
+    ) -> AdminStoreResult<gateway_admin::model::quota_history::QuotaDocumentPage> {
+        unreachable!("测试不读取历史额度文档")
     }
 
     async fn load_quota_forecast_history(
@@ -1082,6 +1096,7 @@ impl AccountStore for FakeAccountStore {
     async fn batch_update_accounts(
         &self,
         command: BatchUpdateAccounts,
+        _: gateway_admin::model::accounts::PreparedQuotaPauses,
         context: &MutationContext,
     ) -> AdminStoreResult<AccountsUpdateResult> {
         self.record("store.batch_update_accounts");
@@ -1128,6 +1143,7 @@ impl AccountStore for FakeAccountStore {
 
 #[derive(Default)]
 struct StaticSettingsStore {
+    reset_credit_on_low_weekly_quota: bool,
     reset_credit_max_weekly_remaining_percent: Option<u32>,
 }
 
@@ -1158,6 +1174,8 @@ impl SettingsStore for StaticSettingsStore {
             rotation_strategy: RotationStrategy::Smart,
             updated_at: Utc::now(),
             values: gateway_admin::model::settings::RuntimeSettingsValues {
+                openai_oauth_guardian_review_model: false,
+                openai_request_country: Default::default(),
                 codex_privacy_policy: Default::default(),
                 request_location_enabled: false,
                 request_location: Default::default(),
@@ -1166,7 +1184,9 @@ impl SettingsStore for StaticSettingsStore {
                 max_concurrent_per_account: 1,
                 max_waiting_per_key: 0,
                 max_waiting_per_account: 0,
-                concurrency_wait_timeout_seconds: 30,
+                key_queue_timeout_seconds: 30,
+                account_queue_timeout_seconds: 30,
+                switch_account_on_queue_failure: false,
                 max_retry_after_seconds: 240,
                 openai_guardian_reserved_concurrency: 0,
                 openai_account_affinity: gateway_core::account::AccountAffinity::Relaxed,
@@ -1174,6 +1194,7 @@ impl SettingsStore for StaticSettingsStore {
                 openai_session_affinity_ttl_hours: 24,
                 responses_max_decompressed_body_bytes: 64 * 1024 * 1024,
                 smart_scheduling: gateway_core::account::SmartSchedulingConfig::default(),
+                quota_reset_window_weights: gateway_core::account::ResetWindowWeights::default(),
                 min_codex_desktop_version: None,
                 min_codex_cli_version: None,
                 usage_retention_days: 30,
@@ -1181,9 +1202,10 @@ impl SettingsStore for StaticSettingsStore {
                 audit_retention_days: 30,
                 account_error_protection: gateway_core::account::AccountErrorProtection::default(),
                 account_warmup_enabled: false,
-                account_warmup_schedule_time: "08:00".to_owned(),
+                account_warmup_cron: "0 8 * * *".to_owned(),
                 account_warmup_model: None,
                 reset_credit_lead_minutes: 10,
+                reset_credit_on_low_weekly_quota: self.reset_credit_on_low_weekly_quota,
                 reset_credit_max_weekly_remaining_percent: self
                     .reset_credit_max_weekly_remaining_percent,
             },
@@ -1906,6 +1928,8 @@ async fn accounts_batch_update_should_commit_once_and_notify_each_provider() {
         .batch_update(
             &context("batch-update-request"),
             BatchUpdateAccounts {
+                quota_settings: None,
+                auto_use_quota_credits: None,
                 model_access: Default::default(),
                 outbound_proxy: None,
                 account_ids: vec!["acct_openai".to_owned(), "acct_xai".to_owned()],
@@ -2073,6 +2097,7 @@ async fn accounts_list_should_degrade_quota_failure_to_empty_window_without_drop
     let events = events();
     let openai = FakeProviderAdmin::new("openai", events.clone());
     openai.set_quota(ProviderQuota {
+        paused_windows: Vec::new(),
         upstream: None,
         credits: None,
         plan_type: None,
@@ -2233,6 +2258,7 @@ async fn accounts_list_should_map_unknown_credential_to_error_not_normal() {
 async fn accounts_list_should_not_derive_rate_limited_from_provider_quota_view() {
     let provider = FakeProviderAdmin::new("openai", events());
     provider.set_quota(ProviderQuota {
+        paused_windows: Vec::new(),
         upstream: None,
         credits: None,
         plan_type: None,
@@ -2284,6 +2310,7 @@ async fn accounts_list_should_not_derive_rate_limited_from_provider_quota_view()
 async fn accounts_list_should_not_derive_exhaustion_from_provider_quota_view() {
     let provider = FakeProviderAdmin::new("openai", events());
     provider.set_quota(ProviderQuota {
+        paused_windows: Vec::new(),
         upstream: None,
         credits: None,
         plan_type: None,
@@ -2549,7 +2576,9 @@ async fn quota_forecast_same_window_reversal_keeps_recorded_usage_in_the_report(
                         usage: usage(index as u64 + 1, tokens),
                         provider_observation: ProviderDocument::new(OpaqueProviderData::new(
                             serde_json::json!({
-                                "percent": percent, "reset": reset.to_rfc3339(), "plan": "pro",
+                                "percent": percent,
+                                "reset": (reset + TimeDelta::seconds(17 * index as i64)).to_rfc3339(),
+                                "plan": "pro",
                             })
                             .as_object()
                             .unwrap()
@@ -2578,14 +2607,14 @@ async fn quota_forecast_same_window_reversal_keeps_recorded_usage_in_the_report(
 }
 
 #[tokio::test]
-async fn quota_forecast_mid_cycle_sampling_accepts_small_reset_jitter_but_not_a_changed_bucket() {
+async fn quota_forecast_keeps_cycle_totals_through_reset_jitter_and_restarts_after_a_reset() {
     use gateway_admin::model::quota_forecast_sampling::QuotaForecastHistoryPoint;
     let now = Utc::now();
     let observed = now - TimeDelta::minutes(1);
     let reset = now + TimeDelta::days(1);
     let added = now - TimeDelta::hours(5);
     let provider = FakeProviderAdmin::new("openai", events());
-    provider.set_quota(ProviderQuota {
+    let mut quota = ProviderQuota {
         upstream: None,
         credits: None,
         plan_type: Some("pro".to_owned()),
@@ -2600,67 +2629,102 @@ async fn quota_forecast_mid_cycle_sampling_accepts_small_reset_jitter_but_not_a_
             role: None,
             local_usage_attribution: QuotaLocalUsageAttribution::AccountWide,
             window_seconds: Some(604_800),
-            used_percent: Some(40.0),
+            used_percent: Some(65.0),
             reset_at: Some(reset),
             limit_reached: false,
             local_usage: None,
             provider_data: None,
         }],
         ..empty_quota()
-    });
+    };
     let mut account = account_record("openai");
     account.created_at = added;
     let store = FakeAccountStore::with_account(account, events());
-    let make_point = |hours, percent, tokens, delta| {
-        QuotaForecastHistoryPoint {
-        started_at: now - TimeDelta::hours(hours) - TimeDelta::seconds(10),
-        completed_at: now - TimeDelta::hours(hours),
-        usage: QuotaForecastUsage { request_count: tokens / 100, tokens, ..Default::default() },
-        provider_observation: ProviderDocument::new(OpaqueProviderData::new(serde_json::json!({
-            "percent": percent, "reset": (reset + TimeDelta::seconds(delta)).to_rfc3339(), "plan": "pro",
-        }).as_object().unwrap().clone())),
-    }
+    let usage = |tokens| QuotaForecastUsage {
+        request_count: tokens / 100,
+        tokens,
+        known_cost_count: tokens / 100,
+        usd: tokens as f64 / 100.0,
+        ..Default::default()
     };
+    let point_with_plan = |hours, percent, tokens, delta, plan: Option<&str>| {
+        let observation = serde_json::json!({
+            "percent": percent,
+            "reset": (reset + TimeDelta::seconds(delta)).to_rfc3339(),
+            "plan": plan,
+        });
+        QuotaForecastHistoryPoint {
+            started_at: now - TimeDelta::hours(hours) - TimeDelta::seconds(10),
+            completed_at: now - TimeDelta::hours(hours),
+            usage: usage(tokens),
+            provider_observation: ProviderDocument::new(OpaqueProviderData::new(
+                observation.as_object().unwrap().clone(),
+            )),
+        }
+    };
+    let make_point =
+        |hours, percent, tokens, delta| point_with_plan(hours, percent, tokens, delta, Some("pro"));
     *store.quota_forecast_history.lock().unwrap() = QuotaForecastHistory {
         points: vec![
-            make_point(3, 20.0, 1_000, 1),
-            make_point(2, 30.0, 1_500, -1),
+            make_point(4, 20.0, 20_000, 0),
+            make_point(3, 58.0, 62_000, 17),
+            make_point(2, 58.0, 62_500, 0),
         ],
-        usage: QuotaForecastUsage {
-            request_count: 20,
-            tokens: 2_000,
-            ..Default::default()
-        },
+        usage: usage(70_600),
         pending_request_count: 1,
     };
-    let services = accounts_service(provider, store.clone()).await;
-    let result = services
-        .accounts()
-        .quota_forecast(&ProviderAccountId::new("acct_test").unwrap())
-        .await
-        .unwrap();
-    assert!(result.forecasts[0].unavailable_reason.is_none());
-    assert_eq!(result.forecasts[0].estimated_tokens, Some(5_000));
+    let services = accounts_service(provider.clone(), store.clone()).await;
+    let account_id = ProviderAccountId::new("acct_test").unwrap();
+    let read_report = async || {
+        services
+            .accounts()
+            .quota_forecast(&account_id)
+            .await
+            .unwrap()
+    };
+    // 回放 #759 的金额和百分比，历史与快照各自报告的到期时间偏移时仍应保留整段累计
+    for offset in [0, 3, 6, 7, 17, -23] {
+        quota.windows[0].reset_at = Some(reset + TimeDelta::seconds(offset));
+        provider.set_quota(quota.clone());
+        let report = read_report().await;
+        let week = &report.forecasts[0];
+        let source = week.source.as_ref().unwrap();
+        assert_eq!(source.tokens, Some(70_600));
+        assert_eq!(source.usd, Some(706.0));
+        assert_eq!(week.estimated_tokens, Some(109_956));
+        assert!((week.estimated_usd.unwrap() - (706.0 + 506.0 * 35.0 / 45.0)).abs() < 1e-9);
+        assert!(week.unavailable_reason.is_none());
+    }
     assert_eq!(store.quota_window_queries()[0].range.start, added);
     store
         .quota_forecast_history
         .lock()
         .unwrap()
         .points
-        .push(make_point(1, 35.0, 1_700, 3_600));
-    let result = services
-        .accounts()
-        .quota_forecast(&ProviderAccountId::new("acct_test").unwrap())
-        .await
-        .unwrap();
-    assert!(result.forecasts[0].estimated_tokens.is_none());
-    assert!(
-        result.forecasts[0]
-            .unavailable_reason
-            .unwrap()
-            .contains("不连续")
+        .push(make_point(1, 62.0, 66_000, 3_600));
+    let result = read_report().await;
+    assert_eq!(
+        result.forecasts[0].source.as_ref().unwrap().tokens,
+        Some(70_600)
     );
-    // 新额度段已有足够观测后恢复预测，但总量不能带回重置前的累计用量
+    assert!(result.forecasts[0].estimated_tokens.is_some());
+    // 两份旧读数的截止时刻均已过去，新请求开始于旧窗口结束后
+    quota.windows[0].used_percent = Some(40.0);
+    provider.set_quota(quota.clone());
+    *store.quota_forecast_history.lock().unwrap() = QuotaForecastHistory {
+        points: vec![
+            make_point(4, 75.0, 1_000, -90_000),
+            make_point(2, 85.0, 1_500, -90_021),
+        ],
+        usage: usage(2_000),
+        ..Default::default()
+    };
+    let waiting = read_report().await;
+    assert_eq!(
+        waiting.forecasts[0].source.as_ref().unwrap().tokens,
+        Some(2_000)
+    );
+    assert!(waiting.forecasts[0].estimated_tokens.is_none());
     let mut first = make_point(1, 5.0, 1_750, 0);
     first.completed_at = now - TimeDelta::minutes(45);
     first.started_at = first.completed_at - TimeDelta::seconds(10);
@@ -2673,15 +2737,42 @@ async fn quota_forecast_mid_cycle_sampling_accepts_small_reset_jitter_but_not_a_
         .unwrap()
         .points
         .extend([first, next]);
-    let result = services
-        .accounts()
-        .quota_forecast(&ProviderAccountId::new("acct_test").unwrap())
-        .await
-        .unwrap();
+    let result = read_report().await;
     let cycle = &result.forecasts[0];
     assert!(cycle.unavailable_reason.is_none());
     assert_eq!(cycle.source.as_ref().unwrap().tokens, Some(250));
     assert_eq!(cycle.estimated_tokens, Some(679));
+
+    for (plan, expected_tokens) in [(None, 2_000), (Some("plus"), 500)] {
+        store.quota_forecast_history.lock().unwrap().points = vec![
+            make_point(4, 20.0, 1_000, 0),
+            point_with_plan(3, 25.0, 1_200, 0, plan),
+            make_point(2, 30.0, 1_500, 0),
+        ];
+        let report = read_report().await;
+        assert_eq!(
+            report.forecasts[0].source.as_ref().unwrap().tokens,
+            Some(expected_tokens)
+        );
+    }
+
+    // 上游提前给出新的七天窗口时，直接从新起点查询，首条配对样本前的用量也留在累计中
+    let new_start = now - TimeDelta::hours(1);
+    quota.windows[0].reset_at = Some(new_start + TimeDelta::days(7));
+    provider.set_quota(quota);
+    *store.quota_forecast_history.lock().unwrap() = QuotaForecastHistory {
+        usage: usage(400),
+        ..Default::default()
+    };
+    let report = read_report().await;
+    assert_eq!(
+        store.quota_window_queries().last().unwrap().range.start,
+        new_start
+    );
+    assert_eq!(
+        report.forecasts[0].source.as_ref().unwrap().tokens,
+        Some(400)
+    );
 }
 
 #[tokio::test]
@@ -2890,6 +2981,7 @@ async fn accounts_list_should_attach_local_usage_to_quota_windows() {
     let provider = FakeProviderAdmin::new("openai", events());
     let reset_at = Utc::now() + TimeDelta::hours(1);
     provider.set_quota(ProviderQuota {
+        paused_windows: Vec::new(),
         upstream: None,
         credits: None,
         plan_type: None,
@@ -3054,6 +3146,7 @@ async fn accounts_list_should_not_attach_account_usage_to_model_specific_quota_w
     let provider = FakeProviderAdmin::new("openai", events());
     let reset_at = Utc::now() + TimeDelta::days(7);
     provider.set_quota(ProviderQuota {
+        paused_windows: Vec::new(),
         upstream: None,
         credits: None,
         plan_type: None,
@@ -3359,6 +3452,7 @@ pub(super) fn document() -> ProviderDocument {
 
 fn empty_quota() -> ProviderQuota {
     ProviderQuota {
+        paused_windows: Vec::new(),
         upstream: None,
         credits: None,
         plan_type: None,
@@ -3396,6 +3490,9 @@ fn quota_local_usage(account_id: &str, total_tokens: u64) -> AccountUsage {
 pub(super) fn account_record(kind: &str) -> AccountRecord {
     let now = Utc::now();
     AccountRecord {
+        quota_paused: false,
+        quota_settings: Default::default(),
+        auto_use_quota_credits: false,
         outbound_proxy_id: None,
         outbound_proxy_enabled: true,
         notes: None,
@@ -3483,6 +3580,7 @@ fn plugin_rotation_facts(account: &AccountRecord) -> PreparedCredentialRotationF
         plan_type: account.plan_type.clone(),
         preserve_profile: true,
         preserve_credential_state: false,
+        preserve_access_token_expiry: false,
         provider_material: document(),
         has_refresh_token: account.has_refresh_token,
         access_token_expires_at: account.access_token_expires_at,

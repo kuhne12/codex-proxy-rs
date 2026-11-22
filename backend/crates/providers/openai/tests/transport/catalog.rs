@@ -412,7 +412,7 @@ fn profile() -> CodexWireProfileState {
         arch: "x86_64".to_owned(),
         terminal: "xterm".to_owned(),
         exact_user_agent: None,
-        installation_id: None,
+        installation_seed: None,
         residency: None,
         account_routing_override: None,
         verified_at: Utc
@@ -431,8 +431,6 @@ fn context() -> CodexRequestContext<'static> {
         request_id: "req_catalog",
         turn_state: None,
         turn_metadata: None,
-        beta_features: None,
-        include_timing_metrics: None,
         version: None,
         codex_window_id: None,
         parent_thread_id: None,
@@ -441,7 +439,6 @@ fn context() -> CodexRequestContext<'static> {
         session_id: None,
         thread_id: None,
         client_request_id: None,
-        turn_id: None,
         account_selection: Default::default(),
     }
 }

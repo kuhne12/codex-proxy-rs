@@ -17,7 +17,10 @@ use tungstenite::http;
 
 use super::{
     client::{CodexBackendClient, CodexClientError, CodexClientResult},
-    websocket::CodexWebSocketRequest,
+    protocol::{
+        responses::CodexResponsesRequest, websocket::websocket_response_create_payload_text,
+    },
+    websocket::CodexWebSocketConnection,
 };
 
 impl CodexBackendClient {
@@ -26,7 +29,32 @@ impl CodexBackendClient {
         self
     }
 
+    // 已识别的互联账号才携带路径，官方端点不参与节点转发
+    pub(super) fn route_to(&self, target: &Url) -> Option<&http::HeaderValue> {
+        self.peer_route.as_ref().filter(|_| {
+            self.protocol != super::client::OpenAiUpstreamProtocol::Codex
+                && !matches!(
+                    target.host_str(),
+                    Some("api.openai.com" | "api.anthropic.com")
+                )
+        })
+    }
+
     pub(super) async fn prepare_http_request(
+        &self,
+        endpoint: String,
+        mut headers: HeaderMap,
+        body: Bytes,
+    ) -> CodexClientResult<reqwest::Request> {
+        let target = Url::parse(&endpoint).map_err(|_| invalid_request())?;
+        headers.remove(gateway_protocol::peer::ROUTE_HEADER);
+        if let Some(path) = self.route_to(&target) {
+            headers.insert(gateway_protocol::peer::ROUTE_HEADER, path.clone());
+        }
+        self.prepare_http_outbound(endpoint, headers, body).await
+    }
+
+    async fn prepare_http_outbound(
         &self,
         endpoint: String,
         headers: HeaderMap,
@@ -79,27 +107,48 @@ impl CodexBackendClient {
 
     pub(super) async fn prepare_websocket_request(
         &self,
-        mut request: CodexWebSocketRequest,
-    ) -> CodexClientResult<(CodexWebSocketRequest, Option<String>)> {
-        let Some(pipeline) = &self.outbound_middleware else {
-            return Ok((request, None));
+        connection: &mut CodexWebSocketConnection,
+        frame: &CodexResponsesRequest,
+    ) -> CodexClientResult<(Option<String>, Option<String>)> {
+        let path = if self.peer_route.is_some()
+            && self.protocol != super::client::OpenAiUpstreamProtocol::Codex
+        {
+            let target = Url::parse(connection.endpoint()).map_err(|_| invalid_request())?;
+            self.route_to(&target)
+                .map(http::HeaderValue::to_str)
+                .transpose()
+                .map_err(|_| invalid_request())?
+        } else {
+            None
         };
-        let uri: http::Uri = request
-            .connection()
+        connection.set_peer_route(path);
+        self.prepare_websocket_outbound(connection, frame).await
+    }
+
+    async fn prepare_websocket_outbound(
+        &self,
+        connection: &mut CodexWebSocketConnection,
+        frame: &CodexResponsesRequest,
+    ) -> CodexClientResult<(Option<String>, Option<String>)> {
+        let Some(pipeline) = &self.outbound_middleware else {
+            return Ok((None, None));
+        };
+        let uri: http::Uri = connection
             .endpoint()
             .parse()
             .map_err(|_| invalid_request())?;
         let outbound = Request {
             target: Target::WebSocket { uri: uri.clone() },
-            headers: request
-                .connection()
+            headers: connection
                 .headers()
                 .iter()
                 .map(|(name, value)| {
                     MiddlewareHeader::new(name.clone(), Bytes::copy_from_slice(value.as_bytes()))
                 })
                 .collect(),
-            body: request.take_payload_text().into(),
+            body: websocket_response_create_payload_text(frame)
+                .map_err(CodexClientError::WebSocketEncode)?
+                .into(),
         };
         let original_headers = outbound
             .header_map()
@@ -135,12 +184,11 @@ impl CodexBackendClient {
             .collect::<CodexClientResult<Vec<_>>>()?;
         let payload = String::from_utf8(prepared.body.into()).map_err(|_| invalid_request())?;
         // 只替换候选 opening 和正文；原请求的 continuation 归属不从插件正文重建
-        request.replace_outbound(endpoint, headers, payload);
-        request
-            .connection
+        connection.replace_outbound(endpoint, headers);
+        connection
             .validate_prepared_opening()
             .map_err(|_| invalid_request())?;
-        Ok((request, profile))
+        Ok((Some(payload), profile))
     }
 }
 

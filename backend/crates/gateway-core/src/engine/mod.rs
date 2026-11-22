@@ -10,7 +10,7 @@ pub mod continuation;
 pub mod coordinator;
 pub mod execution;
 pub mod extensions;
-mod image_generation;
+mod group_permissions;
 pub mod middleware;
 pub mod nested;
 pub mod observation;
@@ -124,6 +124,7 @@ impl AttemptTrigger {
 /// 一旦设置，Provider 在本 attempt 内不得换号或切换 target
 #[derive(Debug, Clone, Default)]
 pub struct AccountAttemptContext {
+    excluded_proxy_endpoints: Vec<crate::upstream::ProxyEndpoint>,
     excluded_accounts: BTreeSet<ProviderAccountId>,
     required_account: Option<ProviderAccountId>,
     state_owner: Option<ProviderAccountStateOwner>,
@@ -140,6 +141,7 @@ impl AccountAttemptContext {
         state_owner: Option<ProviderAccountStateOwner>,
     ) -> Self {
         Self {
+            excluded_proxy_endpoints: Vec::new(),
             excluded_accounts,
             required_account,
             state_owner,
@@ -160,6 +162,7 @@ impl AccountAttemptContext {
     ) -> Self {
         let (required_account, eligibility) = target.into_selection();
         Self {
+            excluded_proxy_endpoints: Vec::new(),
             excluded_accounts,
             required_account: Some(required_account),
             state_owner,
@@ -265,6 +268,8 @@ pub enum ContinuationAttempt {
     ///
     /// 该枚举本身不证明客户端 input 完整，也不授权 Provider 清除 previous-response
     ReplayAny,
+    /// 仅迁移账号绑定，随后要求客户端携带完整历史重放；不得发送当前增量输入
+    RotateForClientReplay,
 }
 
 impl ContinuationAttempt {
@@ -275,6 +280,32 @@ impl ContinuationAttempt {
             Self::Native => "native",
             Self::ReplayOwner => "replay_owner",
             Self::ReplayAny => "replay_any",
+            Self::RotateForClientReplay => "rotate_for_client_replay",
+        }
+    }
+}
+
+/// 插件模型绑定使用同一组 Key、分组、调用链与模型事实。
+#[derive(Clone, Copy)]
+pub struct ModelRouteScope<'a> {
+    pub client_api_key: &'a crate::policy::ClientApiKeyId,
+    pub account_groups: &'a [crate::routing::AccountGroupId],
+    pub extensions: &'a extensions::ExtensionCallScope,
+    pub model: &'a str,
+}
+
+impl<'a> ModelRouteScope<'a> {
+    fn for_attempt(
+        context: &'a AttemptContext,
+        upstream: &'a crate::routing::UpstreamModelId,
+    ) -> Self {
+        Self {
+            client_api_key: context.client_api_key_ref(),
+            account_groups: context.account_group_ids(),
+            extensions: context.extension_scope(),
+            model: context
+                .requested_model()
+                .map_or(upstream.as_str(), |model| model.as_str()),
         }
     }
 }
@@ -289,6 +320,7 @@ pub struct RequestAttemptContext {
     pricing: Arc<crate::metering::PricingOverrides>,
     request_profile: Option<crate::account::OpaqueProviderData>,
     fast_mode: FastMode,
+    openai_request_country: crate::account::OpenAiRequestCountry,
     request_location: Option<crate::account::RequestLocation>,
     privacy: Option<Arc<dyn crate::settings::privacy::CompiledPrivacyPolicy>>,
     request_id: ModelRequestId,
@@ -387,6 +419,15 @@ impl RequestAttemptContext {
     }
 
     #[must_use]
+    pub fn with_openai_request_country(
+        mut self,
+        country: crate::account::OpenAiRequestCountry,
+    ) -> Self {
+        self.openai_request_country = country;
+        self
+    }
+
+    #[must_use]
     pub fn with_request_location(
         mut self,
         location: Option<crate::account::RequestLocation>,
@@ -407,6 +448,7 @@ impl RequestAttemptContext {
             request_profile: None,
             pricing: Arc::default(),
             fast_mode: FastMode::Default,
+            openai_request_country: Default::default(),
             request_location: None,
             privacy: None,
             timing_started_at: Instant::now(),
@@ -593,11 +635,13 @@ impl AttemptContext {
                     .account_state_owner()
                     .filter(|owner| owner.provider() == provider)
                     .map(|owner| owner.account()),
-                ContinuationAttempt::None | ContinuationAttempt::ReplayAny => None,
+                ContinuationAttempt::None
+                | ContinuationAttempt::ReplayAny
+                | ContinuationAttempt::RotateForClientReplay => None,
             });
         self.request.upstream_adapters.as_ref().map_or(
             Ok(upstream_adapter::UpstreamAdapterSelection::Native),
-            |plan| plan.select(self, provider, model, account),
+            |plan| plan.select(ModelRouteScope::for_attempt(self, model), provider, account),
         )
     }
 
@@ -612,7 +656,11 @@ impl AttemptContext {
             .upstream_adapters
             .as_ref()
             .map_or(Ok(None), |plan| {
-                match plan.select(self, provider, model, Some(account))? {
+                match plan.select(
+                    ModelRouteScope::for_attempt(self, model),
+                    provider,
+                    Some(account),
+                )? {
                     upstream_adapter::UpstreamAdapterSelection::Native => Ok(None),
                     upstream_adapter::UpstreamAdapterSelection::Adapter(adapter) => {
                         Ok(Some(adapter))
@@ -633,6 +681,11 @@ impl AttemptContext {
     #[must_use]
     pub const fn client_transport(&self) -> execution::ClientTransport {
         self.request.client_transport
+    }
+
+    #[must_use]
+    pub fn endpoint(&self) -> &str {
+        self.request.endpoint()
     }
 
     /// 原生响应可交付可替换前导事件；中间件可能改变其输出语义
@@ -670,6 +723,11 @@ impl AttemptContext {
     #[must_use]
     pub const fn request_location(&self) -> Option<&crate::account::RequestLocation> {
         self.request.request_location.as_ref()
+    }
+
+    #[must_use]
+    pub const fn openai_request_country(&self) -> &crate::account::OpenAiRequestCountry {
+        &self.request.openai_request_country
     }
 
     /// 当前 attempt 的诊断关联；克隆后可传给后台 transport 任务
@@ -764,19 +822,15 @@ impl AttemptContext {
         terminal: provider::ProviderMiddlewareTerminal,
     ) -> Result<provider::ProviderStream, ProviderError> {
         // 入口已校验原请求，此处复查中间件最终提交的 operation，每次重试均生效
-        let terminal: provider::ProviderMiddlewareTerminal = if self
+        let terminal: provider::ProviderMiddlewareTerminal = if let Some(scope) = self
             .account_scope()
-            .is_some_and(|scope| !scope.allows_image_generation())
+            .filter(|scope| !scope.allows_image_generation() || !scope.allows_subagents())
         {
+            let scope = Arc::clone(scope);
             Box::new(move |operation, headers| {
                 Box::pin(async move {
-                    image_generation::check_image_generation(false, &operation).map_err(|_| {
-                        ProviderError::new(
-                            ProviderErrorKind::RequestPolicyDenied,
-                            UpstreamSendState::NotSent,
-                        )
-                        .with_retry_prohibited()
-                    })?;
+                    group_permissions::check_group_permissions(&scope, &operation, &headers)
+                        .map_err(ProviderError::group_feature_denied)?;
                     terminal(operation, headers).await
                 })
             })
@@ -880,7 +934,7 @@ impl AttemptContext {
         self.deadline
     }
 
-    /// 返回密钥准入、账号选择与重试共用的排队预算
+    /// 返回账号选择与后续重试共用的排队预算
     #[must_use]
     pub const fn concurrency_wait_budget(&self) -> &crate::concurrency::ConcurrencyWaitBudget {
         &self.request.concurrency_wait_budget
@@ -894,6 +948,17 @@ impl AttemptContext {
     #[must_use]
     pub const fn excluded_accounts(&self) -> &BTreeSet<ProviderAccountId> {
         self.account.excluded_accounts()
+    }
+
+    #[must_use]
+    pub fn excludes_proxy(&self, proxy: Option<&crate::account::OutboundProxy>) -> bool {
+        !self.account.excluded_proxy_endpoints.is_empty()
+            && proxy.is_some_and(|proxy| {
+                self.account
+                    .excluded_proxy_endpoints
+                    .iter()
+                    .any(|endpoint| proxy.matches_endpoint(endpoint))
+            })
     }
 
     /// 管理端诊断或请求局部恢复 attempt 强制使用的唯一账号
@@ -963,11 +1028,19 @@ impl AttemptContext {
         model: Option<&str>,
         candidates: &'a [AccountCandidate],
         context: &mut AccountSelectionContext,
+        ownership: policy::AccountScheduleOwnership<'_>,
     ) -> Result<Option<AccountSelection<'a>>, policy::AccountPolicyError> {
         match self.request.request_policy() {
             Some(policy) => {
                 policy
-                    .select_account(self.attempt_index, provider, model, candidates, context)
+                    .select_account(
+                        self.attempt_index,
+                        provider,
+                        model,
+                        candidates,
+                        context,
+                        ownership,
+                    )
                     .await
             }
             None => Ok(crate::account::AccountSelector.select(candidates, context)),

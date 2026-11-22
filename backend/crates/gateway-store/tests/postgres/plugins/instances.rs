@@ -100,6 +100,8 @@ async fn plugin_resource_visibility_uses_ownership_before_pagination() {
         color: AccountGroupColor::parse("#2563EBFF").unwrap(),
         fast_mode: FastMode::Default,
         allow_image_generation: true,
+        allow_subagents: true,
+        model_access: Default::default(),
     };
     // 普通组即使与插件默认名称相同也必须保留；插件组改名不能改变归属
     groups

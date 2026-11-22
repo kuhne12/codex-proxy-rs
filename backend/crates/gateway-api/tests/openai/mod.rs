@@ -4,9 +4,10 @@ mod auth;
 mod chat_completions;
 mod endpoint;
 mod error;
-mod image_policy;
+mod group_permissions;
 mod images;
 mod live;
+mod messages;
 mod middleware;
 mod models;
 mod peer_link;
@@ -133,6 +134,7 @@ pub(crate) fn api_bundle_with_diagnostics(
         Arc::new(crate::support::RecordingDiagnostics::default()),
     ));
     gateway_api::initialize(
+        uuid::Uuid::nil(),
         config,
         execution,
         admin,
@@ -150,6 +152,7 @@ fn api_router_with_config_and_execution(
     execution: Arc<dyn ExecutionService>,
 ) -> axum::Router {
     gateway_api::initialize(
+        uuid::Uuid::nil(),
         config,
         execution,
         admin,
@@ -188,6 +191,7 @@ async fn api_router_with_origins_and_worker_health(
 ) -> axum::Router {
     let admin = crate::admin::AdminTestFixture::new().await;
     gateway_api::initialize(
+        uuid::Uuid::nil(),
         gateway_api::ApiConfig {
             asset_directory: std::env::temp_dir(),
             cors_allowed_origins,
@@ -296,15 +300,23 @@ fn snapshot_with_accounts(
     client_key_id: &str,
     accounts: &[&str],
 ) -> RuntimeSnapshot {
-    snapshot_with_image_policy(plaintext, provider_name, client_key_id, accounts, true)
+    snapshot_with_group_permissions(
+        plaintext,
+        provider_name,
+        client_key_id,
+        accounts,
+        true,
+        true,
+    )
 }
 
-fn snapshot_with_image_policy(
+fn snapshot_with_group_permissions(
     plaintext: &str,
     provider_name: &str,
     client_key_id: &str,
     accounts: &[&str],
     allow_image_generation: bool,
+    allow_subagents: bool,
 ) -> RuntimeSnapshot {
     let provider = ProviderKind::new(provider_name).expect("provider");
     let account_directory = Arc::new(RuntimeAccountDirectory::new(BTreeMap::from_iter(
@@ -341,7 +353,8 @@ fn snapshot_with_image_policy(
                     Arc::clone(&account_directory),
                     ClientRoutingScope::all_accounts(),
                 )
-                .with_image_generation(allow_image_generation),
+                .with_image_generation(allow_image_generation)
+                .with_subagents(allow_subagents),
             ),
             true,
             RateLimits::unlimited(),

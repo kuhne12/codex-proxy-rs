@@ -34,30 +34,6 @@ fn upstream_error_status(error: &CodexClientError) -> Option<u16> {
     }
 }
 
-/// 从上游错误体提取稳定错误码：优先 `/error/code`，其次 `/code`
-///
-/// 只接受有界的 ASCII 标识，避免把自由文本作为错误码写入诊断
-fn upstream_error_code(error: &CodexClientError) -> Option<String> {
-    let CodexClientError::Upstream { body, .. } = error else {
-        return None;
-    };
-    let value = serde_json::from_str::<Value>(body).ok()?;
-    let code = value
-        .pointer("/error/code")
-        .or_else(|| value.pointer("/code"))
-        .and_then(Value::as_str)?
-        .trim();
-    if code.is_empty()
-        || code.len() > 64
-        || !code
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
-    {
-        return None;
-    }
-    Some(code.to_owned())
-}
-
 impl CodexCredentialQuotaService {
     pub fn new(
         repository: CodexCredentialRepository,
@@ -116,15 +92,15 @@ impl CodexCredentialQuotaService {
         Ok(())
     }
 
-    /// 成功推理是额度可访问的权威证据，同时解除账号级 429 冷却
+    /// 成功推理解除账号级 429 冷却；OAuth 额度由额度观测维护
     pub async fn record_successful_inference(
         &self,
         account: &ProviderAccount,
         observed_at: SystemTime,
     ) -> Result<(), CodexCredentialQuotaError> {
-        // 已经发出的并发请求可能晚于耗尽事实成功返回；真实成功仍是独立的
-        // Allowed 权威证据，但调度不会为了试探恢复而放行耗尽账号
-        if account.quota().access() == QuotaAccessState::Exhausted {
+        if account.authentication_kind() != crate::credential::CODEX_AUTHENTICATION_KIND_OAUTH
+            && account.quota().is_exhausted()
+        {
             let outcome = self
                 .store
                 .apply_quota_access(QuotaAccessChange {
@@ -211,10 +187,24 @@ impl CodexCredentialQuotaService {
                 Ok(FetchedCodexQuota { account, value }) => {
                     // 单账号解析或落库失败只影响该账号；其余账号继续同步
                     match self
-                        .apply_fetched_quota(&account, &value, observed_at, &mut summary)
+                        .persist_fetched_quota(
+                            &account,
+                            &value,
+                            observed_at,
+                            QuotaRefreshAuthority::ObserveAccess,
+                        )
                         .await
                     {
-                        Ok(()) => {
+                        Ok(snapshot) => {
+                            if snapshot.quota().is_exhausted() {
+                                summary.exhausted += 1;
+                            } else {
+                                summary.updated += 1;
+                            }
+                            pending_initial.remove(account.id());
+                        }
+                        Err(CodexCredentialQuotaError::RevisionConflict) => {
+                            summary.stale += 1;
                             pending_initial.remove(account.id());
                         }
                         Err(error) => {
@@ -246,6 +236,16 @@ impl CodexCredentialQuotaService {
                                 );
                             }
                         }
+                        Some(QuotaEndpointFailure::AccessTokenRevoked) => {
+                            match self.store.expire_access_token(&account, observed_at).await {
+                                Ok(true) => summary.revoked += 1,
+                                Ok(false) => summary.stale += 1,
+                                Err(error) => {
+                                    summary.transient += 1;
+                                    tracing::warn!(account_id = %account.id(), %error, "OpenAI access token expiry write failed");
+                                }
+                            }
+                        }
                         Some(QuotaEndpointFailure::Credential { state, reason }) => {
                             summary.banned += 1;
                             self.persist_credential_failure(&account, state, reason, observed_at)
@@ -274,64 +274,6 @@ impl CodexCredentialQuotaService {
     #[must_use]
     pub fn runtime_policy(&self) -> &Arc<dyn ProviderRuntimePolicyPort> {
         &self.runtime_policy
-    }
-
-    /// 解析并 revision-fenced 落库单账号的 Provider quota JSON
-    async fn apply_fetched_quota(
-        &self,
-        account: &ProviderAccount,
-        value: &Value,
-        observed_at: SystemTime,
-        summary: &mut CodexQuotaSyncSummary,
-    ) -> Result<(), CodexCredentialQuotaError> {
-        let mut object = normalize_quota_window_placeholders(
-            value
-                .as_object()
-                .cloned()
-                .ok_or(CodexCredentialQuotaError::InvalidCredentialData)?,
-        );
-        object.remove(RECOVERY_FIELD);
-        let mut snapshot = parse_account_quota_snapshot(
-            account.id().clone(),
-            account.revision(),
-            observed_at,
-            &Value::Object(object.clone()),
-        )?;
-        let previous = if account.quota().is_exhausted() {
-            self.read_snapshot_for(account).await?
-        } else {
-            None
-        };
-        let state = reconcile_refresh(
-            account.quota(),
-            &mut snapshot,
-            previous.as_ref(),
-            &mut object,
-        )?;
-        let snapshot = snapshot.with_quota_state(state);
-        let outcome = self
-            .store
-            .compare_and_swap_quota(QuotaObservation {
-                expected_connection: None,
-                plan_type: observed_account_plan(account.plan_type(), snapshot.plan_type()),
-                account_id: account.id().clone(),
-                expected_revision: account.revision(),
-                quota: OpaqueProviderData::new(object),
-                observed_at,
-                state,
-            })
-            .await?;
-        if outcome == QuotaWriteOutcome::Conflict {
-            summary.stale += 1;
-            return Ok(());
-        }
-        self.scheduling.observe(&snapshot);
-        if snapshot.quota().is_exhausted() {
-            summary.exhausted += 1;
-        } else {
-            summary.updated += 1;
-        }
-        Ok(())
     }
 
     /// 真实 429 的单一事实入口：写入 Redis 临时限流冷却（`until = now + retry_after`）
@@ -378,20 +320,32 @@ impl CodexCredentialQuotaService {
         &self,
         account: &ProviderAccount,
     ) -> Result<Option<CodexAccountQuotaSnapshot>, CodexCredentialQuotaError> {
+        Ok(self.read_snapshot_with_base(account).await?.1)
+    }
+
+    async fn read_snapshot_with_base(
+        &self,
+        account: &ProviderAccount,
+    ) -> Result<(QuotaMergeBase, Option<CodexAccountQuotaSnapshot>), CodexCredentialQuotaError>
+    {
         if account.provider().as_str() != "openai" {
             return Err(CodexCredentialQuotaError::NotFound);
         }
         let account_id = account.id();
-        let Some(observation) = self
+        let observation = self
             .store
             .get_quotas(std::slice::from_ref(account_id))
             .await?
             .into_iter()
-            .next()
-        else {
-            return Ok(None);
+            .next();
+        let base = QuotaMergeBase {
+            observed_at: observation.as_ref().map(|obs| obs.observed_at),
         };
-        self.project_observation(account_id, account.revision(), &observation)
+        let snapshot = match observation {
+            Some(obs) => self.project_observation(account_id, account.revision(), &obs)?,
+            None => None,
+        };
+        Ok((base, snapshot))
     }
 
     /// 单账号与目录批量读取共用 revision 校验、窗口解释及调度信号更新
@@ -471,6 +425,11 @@ impl CodexCredentialQuotaService {
                         self.record_confirmed_exhaustion(&account, evidence, None, observed_at)
                             .await?;
                     }
+                    Some(QuotaEndpointFailure::AccessTokenRevoked) => {
+                        self.store
+                            .expire_access_token(&account, observed_at)
+                            .await?;
+                    }
                     Some(QuotaEndpointFailure::Credential { state, reason }) => {
                         self.persist_credential_failure(&account, state, reason, observed_at)
                             .await;
@@ -484,80 +443,118 @@ impl CodexCredentialQuotaService {
                 });
             }
         };
-        let mut object = normalize_quota_window_placeholders(
-            value
-                .as_object()
-                .cloned()
-                .ok_or(CodexCredentialQuotaError::InvalidCredentialData)?,
-        );
-        object.remove(RECOVERY_FIELD);
-        let mut snapshot = parse_account_quota_snapshot(
-            account.id().clone(),
-            account.revision(),
-            observed_at,
-            &Value::Object(object.clone()),
-        )?;
-        let previous = if account.quota().is_exhausted() {
-            self.read_snapshot_for(&account).await?
-        } else {
-            None
-        };
-        // 失败后回读只允许明确可用的点数恢复访问，套餐 allowed 仍可能滞后
-        let observe_access =
-            matches!(authority, QuotaRefreshAuthority::ObserveAccess) || snapshot.credits_usable();
-        if account.quota().is_exhausted() && !observe_access {
+        self.persist_fetched_quota(&account, &value, observed_at, authority)
+            .await
+    }
+
+    async fn persist_fetched_quota(
+        &self,
+        account: &ProviderAccount,
+        value: &Value,
+        observed_at: SystemTime,
+        authority: QuotaRefreshAuthority,
+    ) -> Result<CodexAccountQuotaSnapshot, CodexCredentialQuotaError> {
+        for _ in 0..QUOTA_MERGE_ATTEMPTS {
+            let mut object = normalize_quota_window_placeholders(
+                value
+                    .as_object()
+                    .cloned()
+                    .ok_or(CodexCredentialQuotaError::InvalidCredentialData)?,
+            );
+            object.remove(RECOVERY_FIELD);
+            object.remove(BUCKET_USAGE_FIELD);
+            object.remove(LIMIT_EVIDENCE_FIELD);
+            let mut snapshot = parse_account_quota_snapshot(
+                account.id().clone(),
+                account.revision(),
+                observed_at,
+                &Value::Object(object.clone()),
+            )?;
+            // 请求使用证据与上游比例分开保留，0% 取整不能让主动刷新抹掉已发生的请求
+            let (base, previous) = self.read_snapshot_with_base(account).await?;
+            if base.observed_at.is_some_and(|at| at >= observed_at) {
+                return Err(CodexCredentialQuotaError::RevisionConflict);
+            }
+            let merge_base = Some(base);
+            if let Some(previous) = &previous {
+                snapshot.last_used_at.clone_from(&previous.last_used_at);
+                if !snapshot.last_used_at.is_empty() {
+                    object.insert(
+                        BUCKET_USAGE_FIELD.into(),
+                        serde_json::json!(snapshot.last_used_at),
+                    );
+                }
+            }
+            // 失败后回读只允许明确可用的点数恢复访问，套餐 allowed 仍可能滞后
+            let observe_access = matches!(authority, QuotaRefreshAuthority::ObserveAccess)
+                || (account.auto_use_quota_credits() && snapshot.credits_usable());
+            if account.quota().is_exhausted() && !observe_access {
+                if self
+                    .store
+                    .touch_quota_observation(QuotaObservationTouch {
+                        account_id: account.id().clone(),
+                        expected_revision: account.revision(),
+                        observed_at,
+                    })
+                    .await?
+                    == QuotaWriteOutcome::Conflict
+                {
+                    return Err(CodexCredentialQuotaError::RevisionConflict);
+                }
+                return Ok(match previous {
+                    Some(previous) => {
+                        let previous = previous.with_observed_at(observed_at);
+                        self.scheduling.observe(&previous);
+                        previous
+                    }
+                    None => snapshot
+                        .with_quota_state(account.quota())
+                        .with_observed_at(observed_at),
+                });
+            }
+            snapshot.retain_limit_evidence(
+                account.quota_settings(),
+                previous.as_ref(),
+                &mut object,
+            );
+            let state = if matches!(authority, QuotaRefreshAuthority::PreserveAccess) {
+                snapshot.access_with_credits(account.quota(), account.auto_use_quota_credits())
+            } else {
+                reconcile_refresh(
+                    account.quota(),
+                    account.auto_use_quota_credits(),
+                    &mut snapshot,
+                    previous.as_ref().filter(|_| account.quota().is_exhausted()),
+                    &mut object,
+                )?
+            };
+            let snapshot = snapshot.with_quota_state(state);
             if self
                 .store
-                .touch_quota_observation(QuotaObservationTouch {
+                .compare_and_swap_quota(QuotaObservation {
+                    quota_pause: Some(
+                        snapshot.pause_decision(account.quota_settings(), merge_base),
+                    ),
+                    expected_connection: None,
+                    plan_type: observed_account_plan(account.plan_type(), snapshot.plan_type()),
                     account_id: account.id().clone(),
                     expected_revision: account.revision(),
+                    quota: OpaqueProviderData::new(object),
                     observed_at,
+                    state,
                 })
                 .await?
                 == QuotaWriteOutcome::Conflict
             {
+                if merge_base.is_some() {
+                    continue;
+                }
                 return Err(CodexCredentialQuotaError::RevisionConflict);
             }
-            return Ok(match previous {
-                Some(previous) => {
-                    let previous = previous.with_observed_at(observed_at);
-                    self.scheduling.observe(&previous);
-                    previous
-                }
-                None => snapshot
-                    .with_quota_state(account.quota())
-                    .with_observed_at(observed_at),
-            });
+            self.scheduling.observe(&snapshot);
+            return Ok(snapshot);
         }
-        let state = if observe_access {
-            reconcile_refresh(
-                account.quota(),
-                &mut snapshot,
-                previous.as_ref(),
-                &mut object,
-            )?
-        } else {
-            account.quota()
-        };
-        let snapshot = snapshot.with_quota_state(state);
-        if self
-            .store
-            .compare_and_swap_quota(QuotaObservation {
-                expected_connection: None,
-                plan_type: observed_account_plan(account.plan_type(), snapshot.plan_type()),
-                account_id: account.id().clone(),
-                expected_revision: account.revision(),
-                quota: OpaqueProviderData::new(object),
-                observed_at,
-                state,
-            })
-            .await?
-            == QuotaWriteOutcome::Conflict
-        {
-            return Err(CodexCredentialQuotaError::RevisionConflict);
-        }
-        self.scheduling.observe(&snapshot);
-        Ok(snapshot)
+        Err(CodexCredentialQuotaError::RevisionConflict)
     }
 
     async fn persist_credential_failure(

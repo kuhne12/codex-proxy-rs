@@ -3,13 +3,30 @@
 use std::{fmt, time::Duration};
 
 use gateway_core::account::FastMode;
+use gateway_core::engine::middleware::MiddlewareHeader;
 use gateway_protocol::openai::{
+    CODEX_AUTO_REVIEW_MODEL, CodexGuardianRole,
     CodexResponsesRequestSemantics as CodexRequestSemantics,
     codex_responses_request_semantics_with_turn_metadata, events,
 };
 use reqwest::header::HeaderMap;
 use serde::Serialize;
 use serde_json::{Map, Value};
+
+// 同一来源的多个头照常透传，只有值一致才能用来决定本地传输策略
+fn explicit_guardian_role<'a>(
+    first: &[u8],
+    mut remaining: impl Iterator<Item = &'a [u8]>,
+) -> Option<CodexGuardianRole> {
+    if remaining.any(|value| value != first) {
+        return None;
+    }
+    match first {
+        b"reviewer" => Some(CodexGuardianRole::Reviewer),
+        b"classifier" => Some(CodexGuardianRole::Classifier),
+        _ => None,
+    }
+}
 
 /// 官方 Codex 客户端据此触发完整历史重放的稳定错误码
 pub(crate) const PREVIOUS_RESPONSE_NOT_FOUND_CODE: &str = "previous_response_not_found";
@@ -20,6 +37,29 @@ pub(crate) const PREVIOUS_RESPONSE_NOT_FOUND_MESSAGE: &str =
     "Previous response was not found. Retrying the full request.";
 /// Codex 自动审批（Guardian）请求声明的子代理类型
 const GUARDIAN_SUBAGENT_KIND: &str = "guardian";
+/// 分组显式覆盖后的档位；强制加速仅使用所选账号对该模型的目录声明
+pub(crate) fn fast_policy_tier(
+    mode: FastMode,
+    current: Option<&str>,
+    advertises: impl Fn(&str) -> bool,
+) -> Option<&'static str> {
+    let target = match mode {
+        FastMode::Enabled if advertises("priority") => "priority",
+        FastMode::Ultrafast if advertises("ultrafast") => "ultrafast",
+        FastMode::Disabled
+            if current.is_some_and(|tier| {
+                ["priority", "fast", "ultrafast"]
+                    .iter()
+                    .any(|name| tier.trim().eq_ignore_ascii_case(name))
+            }) =>
+        {
+            "default"
+        }
+        _ => return None,
+    };
+    (current != Some(target)).then_some(target)
+}
+
 /// Codex Responses 上游请求体
 ///
 /// 发往上游的 Responses 请求
@@ -36,6 +76,8 @@ pub struct CodexResponsesRequest {
     body: Map<String, Value>,
     /// API 边界保存、Provider 逐条恢复的普通客户端请求头
     pub(crate) passthrough_headers: HeaderMap,
+    /// 原始请求的 Guardian 身份，保留 HTTP 两侧冲突和 WS 帧边界的判定结果
+    pub(crate) guardian_role: Option<CodexGuardianRole>,
     /// 是否由客户端显式提供了 prompt cache key
     pub explicit_prompt_cache_key: bool,
     /// 客户端会话 ID
@@ -50,8 +92,6 @@ pub struct CodexResponsesRequest {
     pub client_thread_id: Option<String>,
     /// 客户端 request ID，仅保留在受控本地上下文
     pub client_request_id: Option<String>,
-    /// 客户端 turn ID，仅保留在受控本地上下文
-    pub client_turn_id: Option<String>,
     /// 连接池和 affinity 使用的本地会话身份，不发送上游
     pub local_conversation_id: Option<String>,
     /// 变体身份键
@@ -70,12 +110,10 @@ pub struct CodexResponsesRequest {
     pub turn_state: Option<String>,
     /// turn metadata 透传头
     pub turn_metadata: Option<String>,
-    /// beta features 透传头
-    pub beta_features: Option<String>,
+    /// 实际入站为 WS 帧时，观测优先使用本帧的轮次元数据
+    pub(crate) websocket_frame: bool,
     /// 下游 `version` 扩展头；存在时上游值由 Desktop 版本画像统一生成
     pub version: Option<String>,
-    /// timing metrics 透传头
-    pub include_timing_metrics: Option<String>,
     /// Responses Lite 请求语义；HTTP 使用 header，WebSocket 使用 client metadata 投影
     pub responses_lite: Option<String>,
     /// Memory consolidation 请求语义；HTTP 与 WebSocket opening 均使用 header
@@ -496,6 +534,8 @@ pub struct ResponsesSseFailure {
     pub explicit_status_code: Option<u16>,
     /// 上游显式重试间隔，或从官方限流消息中解析出的重试间隔
     pub retry_after_seconds: Option<u64>,
+    /// 上游 `x-retry-metadata: NO_MORE_RETRY`，与重试间隔独立
+    pub no_more_retry: bool,
     /// 当前错误事件自身携带的请求 ID；不是连接 opening ID
     pub(crate) request_id: Option<String>,
     /// 上游错误事件的原始 JSON data；只应在明确的失败审计边界读取
@@ -512,6 +552,7 @@ impl fmt::Debug for ResponsesSseFailure {
             .field("has_upstream_type", &self.upstream_type.is_some())
             .field("explicit_status_code", &self.explicit_status_code)
             .field("retry_after_seconds", &self.retry_after_seconds)
+            .field("no_more_retry", &self.no_more_retry)
             .finish()
     }
 }
@@ -531,6 +572,7 @@ impl ResponsesSseFailure {
             upstream_type: failure_type(value),
             explicit_status_code: failure_explicit_status_code(value),
             retry_after_seconds: events::retry_after_seconds_from_value(value),
+            no_more_retry: events::upstream_no_more_retry(value),
             request_id:
                 crate::transport::diagnostics::CodexUpstreamDiagnostics::error_event_request_id(
                     value,
@@ -594,6 +636,7 @@ impl CodexResponsesRequest {
         Self {
             body,
             passthrough_headers: HeaderMap::new(),
+            guardian_role: None,
             explicit_prompt_cache_key: false,
             client_conversation_id: None,
             client_session_id: None,
@@ -601,7 +644,6 @@ impl CodexResponsesRequest {
             client_account_follow_only: false,
             client_thread_id: None,
             client_request_id: None,
-            client_turn_id: None,
             local_conversation_id: None,
             variant_identity: None,
             client_ip: None,
@@ -611,9 +653,8 @@ impl CodexResponsesRequest {
             force_http_sse: false,
             turn_state: None,
             turn_metadata: None,
-            beta_features: None,
+            websocket_frame: false,
             version: None,
-            include_timing_metrics: None,
             responses_lite: None,
             memgen_request: None,
             codex_window_id: None,
@@ -707,31 +748,6 @@ impl CodexResponsesRequest {
         self.body.get("service_tier").and_then(Value::as_str)
     }
 
-    /// 只改写顶层档位；开启需要目录证据，其他显式档位保留客户端选择
-    pub(crate) fn apply_fast_policy(&mut self, mode: FastMode, supports_priority: bool) -> bool {
-        let tier = self.service_tier().map(str::trim);
-        let target = match mode {
-            FastMode::Disabled
-                if tier.is_some_and(|tier| {
-                    tier.eq_ignore_ascii_case("priority") || tier.eq_ignore_ascii_case("fast")
-                }) =>
-            {
-                "default"
-            }
-            FastMode::Enabled
-                if supports_priority
-                    && (matches!(self.body.get("service_tier"), None | Some(Value::Null))
-                        || tier.is_some_and(|tier| tier.eq_ignore_ascii_case("default"))) =>
-            {
-                "priority"
-            }
-            _ => return false,
-        };
-        self.body
-            .insert("service_tier".to_owned(), Value::String(target.to_owned()));
-        true
-    }
-
     /// 前一个 response ID
     pub fn previous_response_id(&self) -> Option<&str> {
         self.body
@@ -768,19 +784,15 @@ impl CodexResponsesRequest {
         &self,
         previous_reasoning_effort_override: Option<&str>,
     ) -> CodexRequestSemantics {
-        let mut semantics = codex_responses_request_semantics_with_turn_metadata(
+        codex_responses_request_semantics_with_turn_metadata(
             self.body(),
-            self.turn_metadata.as_deref(),
+            gateway_protocol::openai::observed_turn_metadata(
+                self.body(),
+                self.turn_metadata.as_deref(),
+                self.websocket_frame,
+            ),
             previous_reasoning_effort_override,
-        );
-        // 官方 generate=false 只准备连接与上下文，不是模型推理
-        // 预热分类参与用量筛选，不能仅凭客户端的 request_kind 提示排除真实推理
-        if !self.generate() {
-            semantics.request_kind = Some("prewarm".to_owned());
-        } else if semantics.request_kind.as_deref() == Some("prewarm") {
-            semantics.request_kind = None;
-        }
-        semantics
+        )
     }
 
     /// 返回请求语义与 child transport 隔离所用的子代理区分值
@@ -807,6 +819,32 @@ impl CodexResponsesRequest {
     /// Codex 执行命令前的 Guardian 自动审批请求；客户端以 `guardian` 子代理类型声明
     pub fn is_guardian(&self) -> bool {
         self.subagent_kind().as_deref() == Some(GUARDIAN_SUBAGENT_KIND)
+    }
+
+    /// Codex 仅为实际选中的专用审核模型补 reviewer 标记，显式头及中间件仍有各自的覆盖权
+    pub(crate) fn oauth_guardian_role(
+        &self,
+        middleware_headers: &[MiddlewareHeader],
+    ) -> Option<CodexGuardianRole> {
+        const HEADER: &str = "x-codex-guardian";
+        let mut overrides = middleware_headers
+            .iter()
+            .filter(|header| header.name().eq_ignore_ascii_case(HEADER))
+            .map(|header| header.value().as_ref());
+        if let Some(first) = overrides.next() {
+            return explicit_guardian_role(first, overrides);
+        }
+        let mut client = self
+            .passthrough_headers
+            .get_all(HEADER)
+            .iter()
+            .map(|v| v.as_bytes());
+        if let Some(first) = client.next() {
+            return explicit_guardian_role(first, client);
+        }
+        self.guardian_role.filter(|role| {
+            *role != CodexGuardianRole::Reviewer || self.model() == CODEX_AUTO_REVIEW_MODEL
+        })
     }
 
     /// 设置 / 合并 client metadata

@@ -1,7 +1,8 @@
 import type { RequestOptions } from '../request'
+import type { AccountModelAccess } from './accounts'
 import request from '../request'
 
-export type FastMode = 'default' | 'enabled' | 'disabled'
+export type FastMode = 'default' | 'enabled' | 'disabled' | 'ultrafast'
 
 export interface AccountGroupRef {
   pluginOwned: boolean
@@ -30,6 +31,8 @@ export interface AccountGroupUsage {
 export interface AccountGroup extends AccountGroupRef {
   fastMode: FastMode
   allowImageGeneration: boolean
+  allowSubagents: boolean
+  modelAccess: AccountModelAccess
   description: string | null
   memberCount: number
   providerCounts: Record<string, number>
@@ -79,6 +82,8 @@ interface AccountGroupListParams {
 interface AccountGroupCreateParam {
   fastMode?: FastMode
   allowImageGeneration?: boolean
+  allowSubagents?: boolean
+  modelAccess?: AccountModelAccess
   name: string
   description: string | null
   color: string
@@ -87,6 +92,8 @@ interface AccountGroupCreateParam {
 interface AccountGroupUpdateParam {
   fastMode?: FastMode
   allowImageGeneration?: boolean
+  allowSubagents?: boolean
+  modelAccess?: AccountModelAccess
   id: string
   name: string
   description: string | null
@@ -111,6 +118,15 @@ export function getAccountGroupOptions(data: AccountGroupListParams, options: Re
     url: '/api/admin/account-groups/options',
     method: 'GET',
     params: data,
+    ...options,
+  })
+}
+
+export function getAccountGroupModels(id: string, options: RequestOptions = {}) {
+  return request<{ models: Array<{ id: string, label: string }> }>({
+    url: '/api/admin/account-groups/models',
+    method: 'GET',
+    params: { id },
     ...options,
   })
 }

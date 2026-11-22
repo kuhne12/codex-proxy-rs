@@ -515,12 +515,29 @@ async fn live_should_scope_correlation_to_account_and_preserve_business_headers(
         .mount(&upstream)
         .await;
     // 独立账号安装身份分别发送相同客户端标识，同账号重复请求应稳定、不同账号域应隔离
-    for _ in 0..2 {
+    for fedramp in [false, true] {
         let store = Arc::new(MemoryAccountStore::default());
-        create_account(&store, ACCOUNT).await;
+        if fedramp {
+            store
+                .seed_oauth_credential(provider_openai::credential::ImportCodexOAuthCredential {
+                    account_id: ACCOUNT.to_owned(),
+                    name: ACCOUNT.to_owned(),
+                    secret: crate::support::fedramp_secret(&format!("at-{ACCOUNT}")),
+                    verified_account: crate::support::profile(&format!("chatgpt-{ACCOUNT}")),
+                    next_refresh_at: Some(chrono::Utc::now() + chrono::Duration::minutes(30)),
+                    enabled: true,
+                })
+                .await;
+        } else {
+            create_account(&store, ACCOUNT).await;
+        }
         let provider = crate::admin::initialized_test_provider(store, upstream.uri()).await;
         for _ in 0..2 {
             let mut headers = live_protocol_headers();
+            headers.push(gateway_core::operation::ProviderHttpHeader::new(
+                "x-openai-fedramp",
+                Bytes::from_static(b"false"),
+            ));
             headers.push(gateway_core::operation::ProviderHttpHeader::new(
                 "x-test-opaque",
                 Bytes::from_static(b"\x80request"),
@@ -570,7 +587,19 @@ async fn live_should_scope_correlation_to_account_and_preserve_business_headers(
         }
     }
     let requests = upstream.received_requests().await.unwrap();
-    for request in &requests {
+    for (index, request) in requests.iter().enumerate() {
+        let values: Vec<_> = request
+            .headers
+            .get_all("x-openai-fedramp")
+            .iter()
+            .map(|value| value.to_str().unwrap())
+            .collect();
+        let expected: &[&str] = if index < 2 {
+            &["true", "false"]
+        } else {
+            &["true"]
+        };
+        assert_eq!(values, expected);
         assert_live_correlation(&request.headers);
         assert_eq!(
             request.headers["authorization"],
@@ -686,6 +715,7 @@ async fn verify_live_call_identity() {
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpListener;
     let profile = CodexWireProfile {
+        installation_seed: Some("3b11bc82-c666-417d-b9ff-2a34fd040385".to_owned()),
         originator: "codex_cli_rs".to_owned(),
         exact_user_agent: Some("codex_cli_rs/0.160.0 (Linux; x86_64) live-test".to_owned()),
         codex_version: "0.160.0".to_owned(),
@@ -745,11 +775,17 @@ async fn verify_live_call_identity() {
 
     assert_live_correlation(&creation.headers);
     let scoped_session = creation.headers["session-id"].clone();
+    let installation_id = creation.headers["x-codex-installation-id"].clone();
+    assert_ne!(
+        installation_id.to_str().unwrap(),
+        profile.installation_seed.as_deref().unwrap()
+    );
 
     let mut changed_profile = profile.clone();
     changed_profile.exact_user_agent = Some("changed-key-profile".to_owned());
     changed_profile.originator = "changed-originator".to_owned();
     changed_profile.residency = None;
+    changed_profile.installation_seed = Some("a3146f84-64b3-4759-9cf1-a8a001448930".to_owned());
     let current_scope = Arc::new(
         (*scope(AccountModelAccess::default()))
             .clone()
@@ -816,6 +852,7 @@ async fn verify_live_call_identity() {
         );
         let expected = profile.clone();
         let expected_session = scoped_session.clone();
+        let expected_installation_id = installation_id.clone();
         let server = tokio::spawn(async move {
             let mut tls = accept_live_proxy(listener).await;
             if iteration < 2 {
@@ -824,6 +861,10 @@ async fn verify_live_call_identity() {
                     |request: &tokio_tungstenite::tungstenite::handshake::server::Request,
                      _response| {
                         assert_eq!(request.uri().path(), format!("/v1/live/{CALL}"));
+                        assert_eq!(
+                            request.headers()["x-codex-installation-id"],
+                            expected_installation_id
+                        );
                         assert_live_profile(
                             request.headers(),
                             &expected,
@@ -856,6 +897,7 @@ async fn verify_live_call_identity() {
                 );
                 assert_live_correlation(&headers);
                 assert_eq!(headers["session-id"], expected_session);
+                assert_eq!(headers["x-codex-installation-id"], expected_installation_id);
                 tls.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nX-Test-Response: first\r\nX-Test-Response: \x80second\r\nSet-Cookie: private=1\r\nConnection: close\r\n\r\n")
                     .await
                     .unwrap();
@@ -965,7 +1007,6 @@ async fn accept_live_proxy(
         .unwrap()
 }
 
-#[cfg(target_os = "linux")]
 async fn read_live_head(stream: &mut (impl tokio::io::AsyncRead + Unpin)) -> String {
     use tokio::io::AsyncReadExt;
     let mut head = Vec::new();

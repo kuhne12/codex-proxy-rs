@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ZInput, ZScrollbar } from '@codex-proxy/ui'
+import { ZCard, ZInput, ZScrollbar } from '@codex-proxy/ui'
 import { Search } from '@lucide/vue'
 import { useI18n } from 'vue-i18n'
 import ApiKeyConfigModal from '@/components/ApiKeyConfigModal.vue'
@@ -28,7 +28,7 @@ const { showConfig, configKey, configuring, apiBaseUrl, openConfig, copyConfig }
           <KeyUsageHeader v-model:period="period" v-model:refresh-interval="refreshInterval" :name="overview?.key.name" :prefix="overview?.key.prefix" :refreshing="refreshing || overviewLoading" :configuring="configuring" @refresh="refresh" @configure="openConfig" />
           <div class="flex flex-wrap items-center justify-between gap-3">
             <span v-if="overview" class="text-z-sm text-z-text-tertiary">{{ t('usage.page.updated', { asOfDisplay: overview.asOfDisplay }) }}</span>
-            <ZInput id="key-usage-model" v-model="model" class="ml-auto w-full min-w-0 sm:w-md sm:flex-none" :placeholder="t('usage.filters.modelPlaceholder')" :aria-label="t('usage.filters.modelPlaceholder')" :maxlength="128">
+            <ZInput id="key-usage-model" v-model="model" class="ml-auto w-full min-w-0 sm:w-75 sm:flex-none" :placeholder="t('usage.filters.modelPlaceholder')" :aria-label="t('usage.filters.modelPlaceholder')" :maxlength="128">
               <template #prefix>
                 <Search class="size-4.5 text-z-text-tertiary" />
               </template>
@@ -39,7 +39,9 @@ const { showConfig, configKey, configuring, apiBaseUrl, openConfig, copyConfig }
           <KeyUsageSummary :summary="overview.summary" />
           <div class="grid min-w-0 gap-5 xl:grid-cols-[minmax(0,1.4fr)_minmax(400px,1fr)]">
             <KeyUsageTrend class="min-w-0" :points="overview.trend" />
-            <KeyUsageBudget :budget="overview.key" />
+            <ZCard :title="t('usage.budget.quotaOverview')">
+              <KeyUsageBudget :budget="overview.key" />
+            </ZCard>
           </div>
           <RequestHealthTimelineCard :timeline="overview.healthTimeline" />
         </template>

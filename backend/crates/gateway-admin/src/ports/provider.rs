@@ -231,6 +231,19 @@ pub trait ProviderAdmin: Send + Sync {
         self.preview_client_profile(key)
     }
 
+    /// 在批量更新中合并本地身份；缺省、清除和替换分别保留各自语义，不能执行 I/O
+    fn merge_batch_key_profile(
+        &self,
+        current: Option<&gateway_core::account::OpaqueProviderData>,
+        update: Option<&Option<gateway_core::account::OpaqueProviderData>>,
+        installation_seed: Option<uuid::Uuid>,
+    ) -> Result<Option<gateway_core::account::OpaqueProviderData>, ProviderAdminError> {
+        if installation_seed.is_some() {
+            return Err(ProviderAdminError::new(ProviderAdminErrorKind::Unsupported));
+        }
+        Ok(update.map_or_else(|| current.cloned(), Clone::clone))
+    }
+
     /// 提供最终套餐展示名称；未覆盖时采用通用的大驼峰格式
     fn plan_type_display(&self, plan_type: &str) -> String {
         default_plan_type_display(plan_type)
@@ -347,6 +360,11 @@ pub trait ProviderAdmin: Send + Sync {
         _loaded: &gateway_core::account::LoadedCredential,
     ) -> Result<Option<super::peer::PeerConnection>, ProviderAdminError> {
         Ok(None)
+    }
+
+    /// 历史文档由 Provider 按稳定窗口键解释，不支持的 Provider 不扫描请求记录
+    fn quota_history_parser(&self) -> Option<crate::model::quota_history::QuotaHistoryParser> {
+        None
     }
 
     /// 历史观测的协议字段仅由具体 Provider 解释；不支持时保留累计估算

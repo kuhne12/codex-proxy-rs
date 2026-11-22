@@ -1,9 +1,9 @@
 <script setup lang="ts">
 import type { Account } from '@/api'
 
-import { ZButton, ZEmpty, ZIconButton, ZScrollbar } from '@codex-proxy/ui'
+import { ZEmpty, ZScrollbar } from '@codex-proxy/ui'
 
-import { ChartNoAxesCombined, RefreshCw, UserRound } from '@lucide/vue'
+import { ChartNoAxesCombined, Link2, RefreshCw, UserRound } from '@lucide/vue'
 
 import { computed, shallowRef, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
@@ -15,6 +15,8 @@ import AccountProfileModal from '../account-profile-modal/index.vue'
 import AccountQuotaForecastModal from '../account-quota-forecast-modal/index.vue'
 import AccountQuotaCredits from './Credits.vue'
 import AccountQuotaPanelEntry from './Entry.vue'
+import QuotaActionButton from './QuotaActionButton.vue'
+import QuotaSettings from './QuotaSettings.vue'
 import AccountResetCredits from './ResetCredits.vue'
 import AccountUpstreamPool from './UpstreamPool.vue'
 
@@ -37,15 +39,14 @@ const hasUpstreamPool = computed(() => props.account.upstream?.discovered && (
 ))
 
 const quotaEntries = computed(() => groupedAccountQuotaWindows(
-  orderedPanelQuotaWindows(props.account.upstream?.discovered
-    ? props.account.quota.windows.filter(window => window.amount)
-    : props.account.quota.windows),
+  orderedPanelQuotaWindows(props.account.quota.windows.filter(window => window.accountWide)),
 ))
 const profileOpen = shallowRef(false)
 const forecastOpen = shallowRef(false)
 const hasPlanBadge = computed(() => Boolean(props.account.planType) || props.account.authenticationKind === 'api_key')
 const hasForecast = computed(() => props.account.authenticationKind !== 'api_key')
 const hasPersonalInfo = computed(() => props.account.capabilities.profile || props.account.capabilities.subscription)
+const needsPeerDiscovery = computed(() => props.account.upstream?.discovered === false)
 const canRefresh = computed(() => props.account.capabilities.quotaRefresh || props.account.upstream != null)
 const hasActions = computed(() => hasPersonalInfo.value || hasForecast.value || canRefresh.value || props.account.capabilities.resetCredits)
 const lastRefreshed = computed(() => {
@@ -82,36 +83,38 @@ watch(hasPersonalInfo, (available) => {
         <span v-if="lastRefreshed" class="min-w-0 truncate" :title="refreshTitle">{{ lastRefreshed }}</span>
       </p>
       <div v-if="hasActions" class="col-start-2 row-start-1 flex items-center gap-0.5 [&_svg]:size-3.5 [&_svg]:stroke-2">
-        <ZIconButton
+        <QuotaActionButton
           v-if="hasPersonalInfo"
-          :aria-label="t('accounts.quota.viewPersonalInformation')"
-          size="small"
+          :label="t('accounts.quota.viewPersonalInformation')"
           :pressed="profileOpen"
           @click="profileOpen = true"
         >
           <UserRound class="size-3.5" />
-        </ZIconButton>
+        </QuotaActionButton>
+        <QuotaSettings
+          v-if="account.capabilities.quotaSettingsSupported"
+          :key="account.id"
+          :account="account"
+          @account-updated="emit('accountUpdated', $event)"
+        />
         <AccountResetCredits
           v-if="account.capabilities.resetCredits"
           :account="account"
+          @account-updated="emit('accountUpdated', $event)"
           @consumed="emit('quotaReset', $event)"
         />
-        <ZButton
+        <QuotaActionButton
           v-if="hasForecast"
-          :aria-label="t('accounts.quota.forecastWeeklyMonthlyQuota')"
-          size="small"
-          variant="text"
+          :label="t('accounts.quota.forecastWeeklyMonthlyQuota')"
           aria-haspopup="dialog"
-          :aria-expanded="forecastOpen"
+          :pressed="forecastOpen"
           @click="forecastOpen = true"
         >
           <ChartNoAxesCombined class="size-3.5" />
-          {{ t('accounts.quota.estimatedTotal') }}
-        </ZButton>
-        <ZIconButton
+        </QuotaActionButton>
+        <QuotaActionButton
           v-if="canRefresh"
-          size="small"
-          :aria-label="t('accounts.quota.refreshUsageAndCredits')"
+          :label="needsPeerDiscovery ? t('accounts.actions.discoverPeer') : t('accounts.quotaForecast.refreshQuota')"
           :loading="refreshing"
           :disabled="refreshing"
           @click="emit('refreshQuota', account.id)"
@@ -119,15 +122,18 @@ watch(hasPersonalInfo, (available) => {
           <template #loading>
             <RefreshCw class="size-3.5 animate-spin motion-reduce:animate-none" />
           </template>
-          <RefreshCw class="size-3.5" />
-        </ZIconButton>
+          <Link2 v-if="needsPeerDiscovery" class="size-3.5" />
+          <RefreshCw v-else class="size-3.5" />
+        </QuotaActionButton>
       </div>
     </div>
 
     <AccountQuotaCredits
       v-if="account.provider === 'openai' && account.authenticationKind !== 'api_key' || account.quota.credits"
-      :credits="account.quota.credits"
-      class="px-0! pb-3!"
+      :key="account.id"
+      :account="account"
+      class="mb-3 shrink-0 px-0!"
+      @account-updated="emit('accountUpdated', $event)"
     />
     <div v-if="quotaEntries.length === 0 && !hasUpstreamPool" class="grid flex-1 place-items-center">
       <ZEmpty

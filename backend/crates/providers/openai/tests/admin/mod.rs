@@ -69,7 +69,7 @@ const COMPLETED_SESSION_SSE: &str = concat!(
 );
 
 #[tokio::test]
-async fn plan_display_should_distinguish_pro_tiers_and_preserve_other_official_names() {
+async fn plan_display_uses_pro_short_names_and_codex_status_labels_for_other_known_plans() {
     let config = valid_config();
     let bundle = provider_openai::initialize(
         config.config.clone(),
@@ -86,25 +86,25 @@ async fn plan_display_should_distinguish_pro_tiers_and_preserve_other_official_n
         ("free", "Free"),
         ("go", "Go"),
         ("plus", "Plus"),
-        ("team", "Team"),
-        ("self_serve_business_prolite", "Self Serve Business ProLite"),
-        (
-            "self_serve_business_usage_based",
-            "Self Serve Business Usage Based",
-        ),
-        ("business", "Business"),
+        ("team", "Business"),
+        ("self_serve_business_prolite", "Business Premium"),
+        ("self_serve_business_usage_based", "Business"),
+        ("business", "Enterprise"),
         ("ent26", "Enterprise"),
         ("enterprise", "Enterprise"),
         ("hc", "Enterprise"),
         ("enterprise_cbp_automation", "Enterprise (Automation)"),
-        ("enterprise_cbp_usage_based", "Enterprise CBP Usage Based"),
+        ("enterprise_cbp_usage_based", "Enterprise"),
         ("edu", "Edu"),
         ("education", "Edu"),
         ("edu_plus", "Edu Plus"),
         ("edu_pro", "Edu Pro"),
-        ("future_plan", "future_plan"),
+        ("sci", "Academic Researchers"),
+        ("sci_plus", "Academic Researchers Plus"),
+        ("SCI_PLUS", "Academic Researchers Plus"),
+        ("Future_Plan", "Future_Plan"),
     ] {
-        assert_eq!(admin.plan_type_display(raw), display);
+        assert_eq!(admin.plan_type_display(raw), display, "{raw}");
     }
 }
 
@@ -169,7 +169,7 @@ async fn custom_identity_preview_and_dashboard_share_the_exact_request_profile()
 }
 
 #[tokio::test]
-async fn installation_id_is_optional_and_validated_only_for_key_profiles() {
+async fn installation_seed_is_optional_and_validated_only_for_key_profiles() {
     let bundle = provider_openai::initialize(
         valid_config().config,
         provider_ports(),
@@ -189,7 +189,7 @@ async fn installation_id_is_optional_and_validated_only_for_key_profiles() {
     ] {
         let configuration = OpaqueProviderData::new(
             json!({
-                "mode": "custom", "userAgent": "codex-tui/1.0.0", "installationId": value
+                "mode": "custom", "userAgent": "codex-tui/1.0.0", "installationSeed": value
             })
             .as_object()
             .unwrap()
@@ -199,7 +199,7 @@ async fn installation_id_is_optional_and_validated_only_for_key_profiles() {
         assert_eq!(preview.is_ok(), valid);
         if value == id {
             assert_eq!(
-                preview.unwrap().expose_to_provider()["configuration"]["installationId"],
+                preview.unwrap().expose_to_provider()["configuration"]["installationSeed"],
                 id.to_lowercase()
             );
             assert!(provider.preview_client_profile(&configuration).is_err());
@@ -208,14 +208,14 @@ async fn installation_id_is_optional_and_validated_only_for_key_profiles() {
     let doc =
         |value: serde_json::Value| OpaqueProviderData::new(value.as_object().unwrap().clone());
     let global = doc(json!({"mode": "custom", "userAgent": "codex-tui/2.0.0"}));
-    let key = doc(json!({"inherit":{"installationId":id}}));
+    let key = doc(json!({"inherit":{"installationSeed":id}}));
     let preview = provider
         .preview_key_client_profile(&key, Some(&global))
         .unwrap()
         .into_inner();
     assert_eq!(preview["userAgent"], "codex-tui/2.0.0");
     assert_eq!(
-        preview["configuration"]["installationId"],
+        preview["configuration"]["installationSeed"],
         id.to_lowercase()
     );
     assert!(provider.preview_client_profile(&key).is_err());
@@ -352,6 +352,33 @@ async fn quota_forecast_observation_reuses_protocol_parser_and_keeps_window_iden
         .unwrap()
         .clone(),
     ));
+    let history = provider.quota_history_parser().unwrap();
+    let short = history(&document, "codex:18000s").unwrap();
+    assert_eq!(short.used_percent, 4.0);
+    assert_eq!(short.reset_at.unwrap().timestamp(), 1_789_218_647);
+    assert!(history(&document, "other:18000s").is_none());
+    let named = ProviderDocument::new(OpaqueProviderData::new(
+        json!({
+            "rateLimitHeaders": [
+                ["x-codex-primary-used-percent","23"],["x-codex-primary-window-minutes","1"],
+                ["x-feature-primary-used-percent","23"],["x-feature-primary-window-minutes","1"],
+                ["x-feature-secondary-used-percent","56"],["x-feature-secondary-window-minutes","1"]
+            ]
+        })
+        .as_object()
+        .unwrap()
+        .clone(),
+    ));
+    assert!(history(&named, "codex:60s").is_none());
+    assert!(history(&named, "feature:60s").is_none());
+    let primary = history(&named, "feature:60s:primary_window").unwrap();
+    assert_eq!((primary.used_percent, primary.reset_at), (23.0, None));
+    assert_eq!(
+        history(&named, "feature:60s:secondary_window")
+            .unwrap()
+            .used_percent,
+        56.0
+    );
     let observed = provider
         .quota_forecast_observation(&document, &window)
         .unwrap();
@@ -496,13 +523,18 @@ async fn copying_builtin_prices_keeps_cache_read_and_write_fallback_costs() {
     for model in [
         "gpt-4",
         "gpt-4o",
+        "gpt-6.2-astra",
+        "gpt-6.2-sol",
         "gpt-6-astra",
         "gpt-6.1-sol",
         "gpt-6.1-terra",
         "gpt-6-sol",
         "gpt-6-luna",
     ] {
-        let ultrafast_supported = matches!(model, "gpt-6-astra" | "gpt-6.1-sol");
+        let ultrafast_supported = matches!(
+            model,
+            "gpt-6.2-astra" | "gpt-6.2-sol" | "gpt-6-astra" | "gpt-6.1-sol"
+        );
         for band in ["ultrafast", "long_ultrafast"] {
             assert_eq!(prices[model].bands.contains_key(band), ultrafast_supported);
         }
@@ -709,7 +741,7 @@ async fn reset_credit_explicit_http_rejection_should_preserve_the_raw_body() {
 }
 
 #[tokio::test]
-async fn openai_core_provider_projects_codex_request_observation_without_routing_side_effects() {
+async fn openai_core_provider_projects_private_request_observation_without_execution() {
     let config = valid_config();
     let bundle = provider_openai::initialize(
         config.config.clone(),
@@ -723,14 +755,11 @@ async fn openai_core_provider_projects_codex_request_observation_without_routing
         Map::from_iter([
             ("model".to_owned(), json!("gpt-5.4")),
             ("input".to_owned(), json!("summarize")),
-            ("reasoning".to_owned(), json!({"effort": "high"})),
+            ("session_id".to_owned(), json!("observation-session")),
+            ("previous_response_id".to_owned(), json!("resp_previous")),
         ]),
     )
-    .expect("OpenAI payload")
-    .with_context(Map::from_iter([(
-        "turn_metadata".to_owned(),
-        Value::String(r#"{"request_kind":"compaction","subagent_kind":"review"}"#.to_owned()),
-    )]));
+    .expect("OpenAI payload");
     let operation = Operation::Generate(GenerateRequest::from_protocol_payload(payload));
 
     let client_key_id = ClientApiKeyId::new("key_openai_admin_observation").expect("client key");
@@ -738,11 +767,9 @@ async fn openai_core_provider_projects_codex_request_observation_without_routing
         .core_provider()
         .request_observation(&operation, &client_key_id);
 
-    assert_eq!(observation.request_kind.as_deref(), Some("compaction"));
-    assert_eq!(observation.subagent_kind.as_deref(), Some("review"));
-    // Codex 当前只在特定多代理预设组合下给出 reasoning_preset；普通 high 保持空值
-    assert_eq!(observation.reasoning_preset, None);
-    assert!(observation.compact);
+    assert!(observation.continuation.requested);
+    assert!(observation.continuation.previous_response_id_hash.is_some());
+    assert!(observation.continuation.affinity_hash.is_some());
 }
 
 #[tokio::test]
@@ -787,12 +814,6 @@ async fn openai_admin_provider_persists_the_full_pending_envelope_and_binds_owne
         assert!(
             payload
                 .expose_to_provider()
-                .get("reauthorization_credential_revision")
-                .is_none()
-        );
-        assert!(
-            payload
-                .expose_to_provider()
                 .get("installation_id")
                 .and_then(Value::as_str)
                 .and_then(|value| uuid::Uuid::parse_str(value).ok())
@@ -802,13 +823,8 @@ async fn openai_admin_provider_persists_the_full_pending_envelope_and_binds_owne
             mutation.get("schema_version").and_then(Value::as_u64),
             Some(3)
         );
-        assert!(mutation.get("expected_config_revision").is_none());
-        assert!(
-            mutation
-                .get("target")
-                .and_then(Value::as_object)
-                .is_some_and(|target| target.get("expected_credential_revision").is_none())
-        );
+        assert_eq!(mutation["target"]["kind"], "create");
+        assert_eq!(mutation["target"]["name"], "OAuth account");
         assert_eq!(
             mutation.get("started_request_id").and_then(Value::as_str),
             Some("request-start")
@@ -915,9 +931,9 @@ async fn oauth_connection_failures_preserve_safe_diagnostics_and_release_the_cla
         assert_eq!(
             error.public_message(),
             Some(if timed_out {
-                "连接 OpenAI 授权服务超时，请检查出站连接"
+                "连接授权服务超时，请检查出站连接"
             } else {
-                "无法连接 OpenAI 授权服务，请检查出站连接"
+                "无法连接授权服务，请检查出站连接"
             }),
         );
         let mut source = error.source();
@@ -1010,11 +1026,6 @@ async fn openai_reauthorization_pending_payload_reuses_the_account_installation_
         document.get("installation_id").and_then(Value::as_str),
         Some(expected_installation_id.as_str())
     );
-    assert!(
-        document
-            .get("reauthorization_credential_revision")
-            .is_none()
-    );
     assert_eq!(
         target.get("kind").and_then(Value::as_str),
         Some("reauthorize")
@@ -1023,7 +1034,6 @@ async fn openai_reauthorization_pending_payload_reuses_the_account_installation_
         target.get("account_id").and_then(Value::as_str),
         Some("acct_pending_reauth")
     );
-    assert!(target.get("expected_credential_revision").is_none());
 }
 
 #[tokio::test]
@@ -1101,6 +1111,7 @@ async fn openai_admin_batch_quota_isolates_stale_and_invalid_observations() {
             };
             store
                 .compare_and_swap_quota(QuotaObservation {
+                    quota_pause: None,
                     expected_connection: None,
                     account_id: account.id().clone(),
                     expected_revision: account.revision(),
@@ -1212,7 +1223,13 @@ async fn openai_admin_provider_projects_cached_quota_models_and_canonical_export
     let record = account_record(&account);
     let config = valid_config();
     let catalog_cache = Arc::new(TestCatalogCache::default());
-    catalog_cache.seed("plan:pro", ["gpt-5.4"]);
+    catalog_cache.seed(
+        provider_openai::credential::CodexCatalogScope::for_account(&account)
+            .cache_scope()
+            .unwrap()
+            .as_str(),
+        ["gpt-5.4"],
+    );
     let bundle = provider_openai::initialize(
         config.config.clone(),
         provider_ports_with_catalog(
@@ -1445,6 +1462,7 @@ async fn openai_admin_projects_free_plan_from_cached_quota_when_account_claims_o
     let observed_at = SystemTime::now();
     store
         .compare_and_swap_quota(QuotaObservation {
+            quota_pause: None,
             expected_connection: None,
             plan_type: None,
             account_id: account.id().clone(),
@@ -1561,6 +1579,7 @@ async fn openai_admin_provider_projects_official_codex_quota_and_independent_buc
     let observed_at = SystemTime::now();
     store
         .compare_and_swap_quota(QuotaObservation {
+            quota_pause: None,
             expected_connection: None,
             plan_type: None,
             account_id: account.id().clone(),
@@ -1664,6 +1683,7 @@ async fn openai_admin_keeps_confirmed_exhaustion_separate_from_raw_usage_display
     let observed_at = SystemTime::now();
     store
         .compare_and_swap_quota(QuotaObservation {
+            quota_pause: None,
             expected_connection: None,
             plan_type: None,
             account_id: account.id().clone(),
@@ -1776,6 +1796,7 @@ async fn openai_admin_preserves_expired_window_usage_and_exhaustion_attribution(
         };
         store
             .compare_and_swap_quota(QuotaObservation {
+                quota_pause: None,
                 expected_connection: None,
                 plan_type: None,
                 account_id: account.id().clone(),
@@ -1955,7 +1976,7 @@ async fn initialized_provider_reports_a_safe_pat_format_error_before_network_acc
     assert_eq!(error.kind(), ProviderAdminErrorKind::Invalid);
     assert_eq!(
         error.public_message(),
-        Some("Codex PAT 格式无效：应为 at- 开头的完整令牌，不能包含空白或控制字符")
+        Some("请输入完整 PAT，以 at- 开头且不含空白或控制字符")
     );
     assert!(error.message().is_none());
     assert!(!format!("{error:?}").contains("sensitive-token"));
@@ -2178,6 +2199,9 @@ fn provider_ports_with_catalog(
 fn account_record(account: &ProviderAccount) -> AccountRecord {
     let now = Utc::now();
     AccountRecord {
+        quota_paused: false,
+        quota_settings: Default::default(),
+        auto_use_quota_credits: false,
         outbound_proxy_id: None,
         outbound_proxy_enabled: true,
         notes: None,
@@ -2574,7 +2598,42 @@ mod errors {
     use super::*;
 
     #[tokio::test]
-    async fn quota_refresh_exposes_safe_failure_reasons_and_recovers_without_account_errors() {
+    async fn expired_token_prompts_refresh_before_quota_and_profile_queries() {
+        let store = Arc::new(MemoryAccountStore::default());
+        let account_id = ProviderAccountId::new("acct_expired").unwrap();
+        let mut verified_account = profile("chatgpt-expired");
+        verified_account.access_token_expires_at = Some(Utc::now() - chrono::Duration::minutes(1));
+        store
+            .seed_oauth_credential(ImportCodexOAuthCredential {
+                account_id: account_id.as_str().to_owned(),
+                name: "expired".to_owned(),
+                secret: secret("expired-test-token"),
+                verified_account,
+                next_refresh_at: None,
+                enabled: true,
+            })
+            .await;
+        let server = MockServer::start().await;
+        let provider = initialized_test_bundle(store, server.uri())
+            .await
+            .admin_provider();
+        let quota_error = provider
+            .quota(ProviderQuotaRequest {
+                account_id: account_id.clone(),
+                refresh: true,
+                rolling_usage: None,
+            })
+            .await
+            .unwrap_err();
+        let profile_error = provider.profile_statistics(&account_id).await.unwrap_err();
+        for error in [quota_error, profile_error] {
+            assert_eq!(error.public_message(), Some("请先刷新令牌"));
+        }
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn quota_refresh_exposes_safe_rejections_and_recovers_after_revoked_token_rotation() {
         let store = Arc::new(MemoryAccountStore::default());
         let account_id = "acct_quota_error";
         store
@@ -2587,7 +2646,7 @@ mod errors {
                 enabled: true,
             })
             .await;
-        let before = store.account(account_id).expect("account");
+        let mut before = store.account(account_id).expect("account");
         let server = MockServer::start().await;
         let mut config = valid_config();
         config.config.api.base_url = server.uri();
@@ -2603,38 +2662,33 @@ mod errors {
                 401,
                 "token_revoked",
                 Kind::BadGateway,
-                "OpenAI 拒绝了额度查询（HTTP 401，token_revoked）：访问令牌已被撤销，请刷新令牌或重新授权",
+                "访问令牌已撤销，请刷新令牌或重新授权",
             ),
             (
                 401,
                 "unknown_code",
                 Kind::BadGateway,
-                "OpenAI 拒绝了额度查询（HTTP 401），请检查账号授权状态；若令牌已在服务端失效，请重新授权",
+                "账号认证失败，请检查授权状态",
             ),
             (
                 403,
                 "forbidden",
                 Kind::BadGateway,
-                "OpenAI 拒绝了额度查询（HTTP 403），请检查账号授权状态",
+                "额度查询被拒绝，请检查账号权限",
             ),
             (
                 429,
                 "rate_limited",
                 Kind::BadGateway,
-                "OpenAI 额度查询被限流，请稍后重试",
+                "额度查询过于频繁，请稍后重试",
             ),
             (
                 503,
                 "unavailable",
                 Kind::BadGateway,
-                "OpenAI 额度查询服务异常，请稍后重试",
+                "额度服务异常，请稍后重试",
             ),
-            (
-                400,
-                "invalid_request",
-                Kind::Unavailable,
-                "OpenAI 额度查询失败，请检查出站连接与上游服务",
-            ),
+            (400, "invalid_request", Kind::Unavailable, "额度查询失败"),
         ] {
             server.reset().await;
             Mock::given(method("GET"))
@@ -2656,10 +2710,28 @@ mod errors {
             assert_eq!(error.kind(), expected_kind);
             assert_eq!(error.public_message(), Some(expected_message));
             assert!(!format!("{error:?} {error}").contains("raw-secret-marker"));
-            assert_eq!(
-                store.account(account_id).expect("account after rejection"),
-                before
-            );
+            let current = store.account(account_id).expect("account after rejection");
+            if code == "token_revoked" {
+                assert_eq!(
+                    current
+                        .status_projection(SystemTime::now(), None)
+                        .error_reason,
+                    Some(gateway_core::account::AccountErrorReason::AccessTokenExpired)
+                );
+                store
+                    .repository()
+                    .rotate_refreshed_oauth_secret(
+                        &before,
+                        secret("replacement-test-token"),
+                        before.access_token_expires_at(),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                before = store.account(account_id).expect("account after rotation");
+            } else {
+                assert_eq!(current, before);
+            }
         }
         server.reset().await;
         Mock::given(method("GET"))
@@ -2687,12 +2759,8 @@ mod errors {
     #[tokio::test]
     async fn manual_refresh_preserves_banned_evidence_without_promoting_401_to_terminal() {
         for (status, kind, message) in [
-            (400, Kind::Invalid, "Codex 账号已被停用，请检查账号状态"),
-            (
-                401,
-                Kind::BadGateway,
-                "OpenAI 拒绝了令牌刷新，请检查账号授权状态",
-            ),
+            (400, Kind::Invalid, "上游账号已停用"),
+            (401, Kind::BadGateway, "令牌刷新被拒绝，请检查账号授权"),
         ] {
             let server = MockServer::start().await;
             Mock::given(method("POST"))
@@ -2752,7 +2820,7 @@ mod errors {
                 401,
                 "unknown",
                 Kind::BadGateway,
-                "OpenAI 拒绝了令牌刷新，请检查账号授权状态",
+                "令牌刷新被拒绝，请检查账号授权",
             ),
             (
                 400,
@@ -2776,19 +2844,19 @@ mod errors {
                 400,
                 "INVALID_GRANT",
                 Kind::BadGateway,
-                "刷新令牌无效或已失效，请重新授权",
+                "刷新令牌无效，请重新授权",
             ),
             (
                 429,
                 "unknown",
                 Kind::BadGateway,
-                "OpenAI 令牌刷新请求被限流，请稍后重试",
+                "令牌刷新过于频繁，请稍后重试",
             ),
             (
                 503,
                 "unknown",
                 Kind::BadGateway,
-                "OpenAI 令牌刷新服务异常，请稍后重试",
+                "令牌刷新服务异常，请稍后重试",
             ),
         ] {
             let server = MockServer::start().await;
@@ -2824,7 +2892,7 @@ mod errors {
                 true,
                 false,
                 Kind::Conflict,
-                "令牌刷新繁忙，请等待当前刷新完成后重试",
+                "令牌刷新繁忙，请稍后重试",
             ),
             (
                 false,
@@ -2838,7 +2906,7 @@ mod errors {
                 true,
                 true,
                 Kind::Conflict,
-                "账号凭据已被更新，请刷新账号列表后重试",
+                "凭据已更新，请刷新账号列表",
             ),
         ] {
             let server = MockServer::start().await;
@@ -2884,7 +2952,7 @@ mod errors {
         assert_eq!(error.kind(), Kind::Ambiguous);
         assert_eq!(
             error.public_message(),
-            Some("令牌刷新结果未知，请先核对账号状态，不要立即重复刷新")
+            Some("刷新结果未知，核对账号状态前请勿重试")
         );
         assert!(!format!("{error:?}").contains("invalid-success-secret-marker"));
 
@@ -2901,11 +2969,10 @@ mod errors {
             .prepare_refresh(command())
             .await
             .unwrap_err();
-        // 既有 transport 策略未认定此错误为安全重试，本次不能因展示更详细而放宽重试边界
         assert_eq!(error.kind(), Kind::Ambiguous);
         assert_eq!(
             error.public_message(),
-            Some("令牌刷新结果未知，请先核对账号状态，不要立即重复刷新")
+            Some("刷新结果未知，核对账号状态前请勿重试")
         );
         assert_eq!(store.account("acct_refresh_error").unwrap(), before);
     }
@@ -3045,7 +3112,8 @@ async fn api_key_admin_exposes_only_configuration_and_preserves_key_when_rotatin
         .unwrap()
         .unwrap();
     let configuration = configuration.expose_to_provider().expose_to_provider();
-    assert_eq!(configuration.len(), 2);
+    assert_eq!(configuration.len(), 3);
+    assert_eq!(configuration.get("protocol"), Some(&json!("responses")));
     assert_eq!(
         configuration.get("base_url"),
         Some(&json!("https://first.example/v1"))
@@ -3164,6 +3232,7 @@ async fn oauth_transport_settings_preserve_tokens_refresh_schedule_and_health() 
         );
         assert_eq!(facts.has_refresh_token, account.has_refresh_token());
         assert!(facts.preserve_profile && facts.preserve_credential_state);
+        assert!(facts.preserve_access_token_expiry);
     }
     for invalid in [
         json!({"transport":"invalid"}),

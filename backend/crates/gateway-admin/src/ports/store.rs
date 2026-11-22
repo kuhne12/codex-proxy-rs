@@ -22,9 +22,11 @@ use crate::model::{
     },
     auth::{AdminAuditEvent, AuthSession},
     client_keys::{
-        ClientKeyBudgetMutationOrigin, ClientKeyListQuery, ClientKeyPage, ClientKeyRecord,
-        ClientKeySecret, DeleteClientKey, NewClientKey, ResetClientKeyBudget, SetClientKeyEnabled,
-        UpdateClientKey, UpdateClientKeyBudgetLimits,
+        BatchUpdateClientKeys, BudgetReferenceAccountPage, ClientKeyBudgetMutationOrigin,
+        ClientKeyBudgetWindow, ClientKeyBudgetWindowPeriod, ClientKeyListQuery, ClientKeyPage,
+        ClientKeyRecord, ClientKeySecret, DeleteClientKey, NewClientKey, ResetClientKeyBudget,
+        SetClientKeyBudgetWindow, SetClientKeyEnabled, UpdateClientKey,
+        UpdateClientKeyBudgetLimits,
     },
     observability::{
         DashboardObservation, DashboardQuery, DiagnosticDimension, DiagnosticsObservation,
@@ -108,6 +110,13 @@ impl AdminStoreError {
 
 pub type AdminStoreResult<T> = Result<T, AdminStoreError>;
 
+/// 在持有密钥行锁时用 Provider 准备好的纯合并操作更新原有画像
+pub type BatchClientKeyProfileMerger = Box<
+    dyn Fn(&mut crate::model::client_keys::ProviderRequestProfileOverrides) -> AdminStoreResult<()>
+        + Send
+        + Sync,
+>;
+
 /// 账号目录与公共账号写操作
 #[async_trait]
 pub trait AccountStore:
@@ -178,6 +187,16 @@ pub trait AccountStore:
         &self,
         windows: &[AccountUsageWindowQuery],
     ) -> AdminStoreResult<Vec<AccountUsageWindowResult>>;
+
+    /// 按完成时间倒序读取一页保留的请求观测，不按本地计费结果筛选
+    async fn quota_documents(
+        &self,
+        account: &gateway_core::account::ProviderAccountId,
+        provider: &gateway_core::routing::ProviderKind,
+        created_at: DateTime<Utc>,
+        range: TimeRange,
+        before: Option<&crate::model::quota_history::QuotaHistoryCursor>,
+    ) -> AdminStoreResult<crate::model::quota_history::QuotaDocumentPage>;
 
     /// 从同一数据库语句取得截止快照的累计用量和有界历史观测
     async fn load_quota_forecast_history(
@@ -254,6 +273,7 @@ pub trait AccountStore:
     async fn batch_update_accounts(
         &self,
         command: BatchUpdateAccounts,
+        pauses: crate::model::accounts::PreparedQuotaPauses,
         context: &MutationContext,
     ) -> AdminStoreResult<AccountsUpdateResult>;
 
@@ -365,6 +385,31 @@ pub trait AuthStore: Send + Sync {
 /// Client API Key 资料读取与管理写入
 #[async_trait]
 pub trait ClientKeyStore: Send + Sync {
+    async fn client_key_budget(
+        &self,
+        id: &gateway_core::policy::ClientApiKeyId,
+    ) -> AdminStoreResult<Option<gateway_core::engine::budget::ClientBudgetStatus>>;
+
+    async fn budget_reference_accounts(
+        &self,
+        id: &gateway_core::policy::ClientApiKeyId,
+        search: &str,
+        after: &str,
+    ) -> AdminStoreResult<BudgetReferenceAccountPage>;
+
+    async fn client_key_budget_window(
+        &self,
+        id: &gateway_core::policy::ClientApiKeyId,
+        period: ClientKeyBudgetWindowPeriod,
+    ) -> AdminStoreResult<ClientKeyBudgetWindow>;
+
+    async fn set_client_key_budget_window(
+        &self,
+        command: SetClientKeyBudgetWindow,
+        origin: ClientKeyBudgetMutationOrigin,
+        context: &MutationContext,
+    ) -> AdminStoreResult<u64>;
+
     /// 按已验证的 ID 读取资料，不读取完整明文 Key
     async fn get_client_key(
         &self,
@@ -389,6 +434,13 @@ pub trait ClientKeyStore: Send + Sync {
         command: UpdateClientKey,
         context: &MutationContext,
     ) -> AdminStoreResult<(Revision, ClientKeyRecord)>;
+
+    async fn batch_update_client_keys(
+        &self,
+        command: BatchUpdateClientKeys,
+        merge_profiles: BatchClientKeyProfileMerger,
+        context: &MutationContext,
+    ) -> AdminStoreResult<Revision>;
 
     async fn set_client_key_enabled(
         &self,
@@ -455,6 +507,7 @@ pub trait AccountGroupStore: Send + Sync {
         context: &MutationContext,
     ) -> AdminStoreResult<AccountGroupMutation>;
 
+    /// 仍有 API Key 引用分组时返回 Conflict
     async fn delete_account_group(
         &self,
         command: DeleteAccountGroup,
@@ -491,6 +544,19 @@ pub trait ObservabilityStore: Send + Sync {
         range: TimeRange,
         granularity: Granularity,
     ) -> AdminStoreResult<Vec<RequestMetricPoint>>;
+
+    async fn client_key_statistics(
+        &self,
+        range: TimeRange,
+        id: &gateway_core::policy::ClientApiKeyId,
+        query: crate::model::observability::KeyUsageMetric,
+    ) -> AdminStoreResult<crate::model::observability::KeyStatisticsOverview>;
+
+    async fn client_key_models(
+        &self,
+        range: TimeRange,
+        id: &gateway_core::policy::ClientApiKeyId,
+    ) -> AdminStoreResult<Vec<crate::model::observability::KeyModelRow>>;
 
     async fn usage_trend(
         &self,

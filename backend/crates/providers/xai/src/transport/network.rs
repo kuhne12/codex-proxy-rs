@@ -424,14 +424,19 @@ impl GrokInferenceTransport for ReqwestGrokInferenceTransport {
             }
             let dns_observer = Arc::new(RequestDnsObserver::default());
             let headers_started_at = Instant::now();
-            let response = REQUEST_DNS_OBSERVER
-                .scope(Arc::clone(&dns_observer), builder.send())
-                .await
-                .map_err(|error| {
-                    classify_inference_reqwest_error(error).with_transport_metrics(
-                        inference_transport_metrics(client_cache_status, None, &dns_observer),
-                    )
-                })?;
+            let response =
+                REQUEST_DNS_OBSERVER
+                    .scope(Arc::clone(&dns_observer), builder.send())
+                    .await
+                    .map_err(|error| {
+                        classify_inference_reqwest_error(
+                            error,
+                            request.binding().outbound_proxy().is_some(),
+                        )
+                        .with_transport_metrics(
+                            inference_transport_metrics(client_cache_status, None, &dns_observer),
+                        )
+                    })?;
             let transport_metrics = inference_transport_metrics(
                 client_cache_status,
                 Some(elapsed_millis(headers_started_at.elapsed())),
@@ -689,6 +694,10 @@ fn build_official_client(
     timeout: Option<Duration>,
     proxy: Option<&OutboundProxy>,
 ) -> Result<Client, GrokReqwestTransportBuildError> {
+    let target = Url::parse(&format!("https://{}", dns_policy.allowed_host))
+        .map_err(|_| GrokReqwestTransportBuildError::ClientInitialization)?;
+    let proxy = gateway_egress::for_destination(proxy, &target)
+        .map_err(|_| GrokReqwestTransportBuildError::ClientInitialization)?;
     let mut builder = Client::builder()
         // 工作区可能同时启用 native-tls；与官方 Grok CLI 一样显式固定 rustls，避免握手画像漂移
         .use_rustls_tls()
@@ -1001,7 +1010,10 @@ fn inference_http_diagnostic(error: &reqwest::Error) -> ProviderDiagnostic {
         .with_io_cause(error)
 }
 
-fn classify_inference_reqwest_error(error: reqwest::Error) -> GrokInferenceTransportError {
+fn classify_inference_reqwest_error(
+    error: reqwest::Error,
+    uses_account_proxy: bool,
+) -> GrokInferenceTransportError {
     let (kind, send_state) = if error.is_builder() {
         (
             GrokInferenceTransportErrorKind::Protocol,
@@ -1023,8 +1035,12 @@ fn classify_inference_reqwest_error(error: reqwest::Error) -> GrokInferenceTrans
             UpstreamSendState::Ambiguous,
         )
     };
-    let failure = GrokInferenceTransportError::new(kind, send_state)
-        .with_diagnostic(inference_http_diagnostic(&error));
+    let mut diagnostic = inference_http_diagnostic(&error);
+    if uses_account_proxy && error.is_connect() {
+        diagnostic =
+            diagnostic.with_proxy_hint(gateway_core::error::ProxyConnectionHint::CheckProxy);
+    }
+    let failure = GrokInferenceTransportError::new(kind, send_state).with_diagnostic(diagnostic);
     with_inference_reqwest_source(failure, error)
 }
 
@@ -1140,18 +1156,28 @@ async fn classify_inference_status(
     if let Some(raw) = raw {
         error = error.with_raw_upstream_error(raw);
     }
-    let diagnostic_code = if status == StatusCode::BAD_REQUEST && reasoning_decode_failed(&metadata)
+    let (code, message) = if status == StatusCode::BAD_REQUEST && reasoning_decode_failed(&metadata)
     {
-        "reasoning_decode_failed"
+        ("reasoning_decode_failed", "上游无法解码加密的推理内容")
     } else {
-        body_failure.map_or("upstream_failure", GrokBodyFailure::marker)
+        let message = match (body_failure, kind) {
+            (
+                Some(GrokBodyFailure::ModelCapacity),
+                GrokInferenceTransportErrorKind::RateLimited,
+            ) => "上游模型容量不足",
+            (
+                Some(GrokBodyFailure::EmptyUpstream),
+                GrokInferenceTransportErrorKind::Unavailable,
+            ) => "上游未返回模型响应",
+            _ => kind.diagnostic_message(),
+        };
+        (
+            body_failure.map_or("upstream_failure", GrokBodyFailure::marker),
+            message,
+        )
     };
-    error = error.with_diagnostic(
-        ProviderDiagnostic::new(format!(
-            "xAI upstream rejected request: status={status_code}"
-        ))
-        .with_classification("upstream", diagnostic_code),
-    );
+    error = error
+        .with_diagnostic(ProviderDiagnostic::new(message).with_classification("upstream", code));
     error = error.with_upstream_failure_fields(gateway_core::upstream::UpstreamFailureFields {
         status: Some(status_code),
         code: metadata.original_code,
@@ -1205,7 +1231,7 @@ enum GrokBodyFailure {
 impl GrokBodyFailure {
     fn transport_kind(self) -> GrokInferenceTransportErrorKind {
         match self {
-            Self::Quota(failure) => quota_transport_error_kind(failure),
+            Self::Quota(failure) => GrokInferenceTransportErrorKind::from_quota(failure),
             Self::Billing => GrokInferenceTransportErrorKind::PaymentRequired,
             Self::EmptyUpstream => GrokInferenceTransportErrorKind::Unavailable,
             Self::ModelCapacity | Self::RateLimit => GrokInferenceTransportErrorKind::RateLimited,
@@ -1356,7 +1382,7 @@ fn first_string(object: &serde_json::Map<String, Value>, fields: &[&str]) -> Opt
 fn classify_payment_required(metadata: &InferenceErrorMetadata) -> GrokInferenceTransportErrorKind {
     quota_failure(metadata).map_or(
         GrokInferenceTransportErrorKind::PaymentRequired,
-        quota_transport_error_kind,
+        GrokInferenceTransportErrorKind::from_quota,
     )
 }
 
@@ -1376,7 +1402,7 @@ fn classify_forbidden(
     } else if let Some(failure) = body_failure {
         failure.transport_kind()
     } else if let Some(failure) = quota_failure(metadata) {
-        quota_transport_error_kind(failure)
+        GrokInferenceTransportErrorKind::from_quota(failure)
     } else if model_access_denied(metadata) {
         GrokInferenceTransportErrorKind::ModelAccessDenied
     } else {
@@ -1389,7 +1415,7 @@ fn classify_too_many_requests(
 ) -> GrokInferenceTransportErrorKind {
     quota_failure(metadata).map_or(
         GrokInferenceTransportErrorKind::RateLimited,
-        quota_transport_error_kind,
+        GrokInferenceTransportErrorKind::from_quota,
     )
 }
 
@@ -1423,16 +1449,6 @@ fn quota_failure(metadata: &InferenceErrorMetadata) -> Option<GrokQuotaFailureKi
         metadata.error_type.as_deref(),
         metadata.message.as_deref(),
     )
-}
-
-fn quota_transport_error_kind(failure: GrokQuotaFailureKind) -> GrokInferenceTransportErrorKind {
-    match failure {
-        GrokQuotaFailureKind::Account => GrokInferenceTransportErrorKind::QuotaExhausted,
-        GrokQuotaFailureKind::FreeAccount => GrokInferenceTransportErrorKind::FreeQuotaExhausted,
-        GrokQuotaFailureKind::FreeModelUsage => {
-            GrokInferenceTransportErrorKind::ModelQuotaExhausted
-        }
-    }
 }
 
 fn model_access_denied(metadata: &InferenceErrorMetadata) -> bool {

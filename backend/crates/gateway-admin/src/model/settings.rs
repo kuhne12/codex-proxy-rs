@@ -45,6 +45,8 @@ pub use gateway_core::account::RotationStrategy;
 /// 运行设置的共同值；版本、Provider 画像更新和数据库秘密由外层类型拥有
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RuntimeSettingsValues {
+    pub openai_oauth_guardian_review_model: bool,
+    pub openai_request_country: gateway_core::account::OpenAiRequestCountry,
     pub codex_privacy_policy: gateway_core::settings::privacy::CodexPrivacyPolicy,
     pub request_location_enabled: bool,
     pub request_location: gateway_core::account::RequestLocation,
@@ -53,7 +55,9 @@ pub struct RuntimeSettingsValues {
     pub max_concurrent_per_account: u32,
     pub max_waiting_per_key: u32,
     pub max_waiting_per_account: u32,
-    pub concurrency_wait_timeout_seconds: u32,
+    pub key_queue_timeout_seconds: u32,
+    pub account_queue_timeout_seconds: u32,
+    pub switch_account_on_queue_failure: bool,
     pub max_retry_after_seconds: u32,
     pub openai_guardian_reserved_concurrency: u32,
     pub openai_account_affinity: gateway_core::account::AccountAffinity,
@@ -61,6 +65,7 @@ pub struct RuntimeSettingsValues {
     pub openai_session_affinity_ttl_hours: u32,
     pub responses_max_decompressed_body_bytes: u64,
     pub smart_scheduling: gateway_core::account::SmartSchedulingConfig,
+    pub quota_reset_window_weights: gateway_core::account::ResetWindowWeights,
     pub min_codex_desktop_version: Option<String>,
     pub min_codex_cli_version: Option<String>,
     pub usage_retention_days: u32,
@@ -68,8 +73,9 @@ pub struct RuntimeSettingsValues {
     pub audit_retention_days: u32,
     pub account_error_protection: gateway_core::account::AccountErrorProtection,
     pub account_warmup_enabled: bool,
-    pub account_warmup_schedule_time: String,
+    pub account_warmup_cron: String,
     pub account_warmup_model: Option<String>,
+    pub reset_credit_on_low_weekly_quota: bool,
     pub reset_credit_lead_minutes: u32,
     pub reset_credit_max_weekly_remaining_percent: Option<u32>,
 }
@@ -195,13 +201,17 @@ impl RuntimeSettingsValues {
         {
             return Err("reset_credit_max_weekly_remaining_percent");
         }
+        self.openai_request_country
+            .validate()
+            .map_err(|_| "openai_request_country")?;
         self.request_location
             .validate()
             .map_err(|_| "request_location")?;
         gateway_core::settings::validate_request_limits(
             self.max_waiting_per_key,
             self.max_waiting_per_account,
-            self.concurrency_wait_timeout_seconds,
+            self.key_queue_timeout_seconds,
+            self.account_queue_timeout_seconds,
             self.max_account_rotations,
             self.openai_session_affinity_ttl_hours,
         )?;
@@ -230,7 +240,7 @@ impl RuntimeSettingsValues {
         self.account_error_protection.validate()?;
         gateway_core::provider_ports::ProviderWarmupPolicy::validate_values(
             self.account_warmup_enabled,
-            &self.account_warmup_schedule_time,
+            &self.account_warmup_cron,
             self.account_warmup_model.as_deref(),
         )?;
         Ok(())

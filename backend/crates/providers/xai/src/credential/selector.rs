@@ -10,8 +10,8 @@ use gateway_core::account::{
     AccountSelector, CredentialState, ProviderAccount, ProviderAccountId, QuotaAccessState,
     QuotaEvidence, QuotaState,
 };
-use gateway_core::concurrency::{CapacityWait, ConcurrencyWaitQueue};
-use gateway_core::engine::policy::AccountPolicyError;
+use gateway_core::concurrency::{CapacityWait, ConcurrencyQueuePolicy, ConcurrencyWaitQueue};
+use gateway_core::engine::policy::{AccountPolicyError, AccountScheduleOwnership};
 use gateway_core::provider_ports::{
     ProviderCooldown, ProviderCooldownPort, ProviderCooldownScope, ProviderLeaseAcquisition,
     ProviderLeasePort, ProviderLeaseRequest, ProviderSchedulingLeaseRequest,
@@ -93,7 +93,38 @@ impl GrokAccountSessionSelector {
         &self,
         request: GrokSessionSelection,
     ) -> Result<SelectedGrokSession, GrokSessionSelectorError> {
-        let queue_policy = request.account_selection_policy().queue_policy();
+        let policy = request.account_selection_policy();
+        let select = |queue| self.select_with_queue(&request, queue);
+        match select(policy.queue_policy()).await {
+            Err(GrokSessionSelectorError::QueueRejected(reason))
+                if request.required_account().is_none() =>
+            {
+                policy
+                    .reselect_after_queue_rejection(
+                        reason,
+                        request.deadline().remaining(),
+                        select,
+                        |err| {
+                            matches!(
+                                err,
+                                GrokSessionSelectorError::CapacityUnavailable { .. }
+                                    | GrokSessionSelectorError::NoEligibleSession
+                                    | GrokSessionSelectorError::AccountCoolingDown { .. }
+                                    | GrokSessionSelectorError::ModelCoolingDown { .. }
+                            )
+                        },
+                    )
+                    .await
+            }
+            result => result,
+        }
+    }
+
+    async fn select_with_queue(
+        &self,
+        request: &GrokSessionSelection,
+        queue_policy: ConcurrencyQueuePolicy,
+    ) -> Result<SelectedGrokSession, GrokSessionSelectorError> {
         let mut waiting = CapacityWait::new(
             &self.waiting,
             queue_policy,
@@ -145,6 +176,9 @@ impl GrokAccountSessionSelector {
                 .into_iter()
                 .filter(|account| {
                     request.upstream_context.as_ref().is_none_or(|context| {
+                        if context.excludes_proxy(account.outbound_proxy()) {
+                            return false;
+                        }
                         context
                             .upstream_adapter_for_account(
                                 &self.provider_kind,
@@ -291,6 +325,10 @@ impl GrokAccountSessionSelector {
                                 Some(request.upstream_model().as_str()),
                                 &candidates,
                                 &mut context,
+                                AccountScheduleOwnership {
+                                    pinned_account: request.required_account(),
+                                    ..Default::default()
+                                },
                             )
                             .await
                     }

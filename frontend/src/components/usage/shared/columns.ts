@@ -58,6 +58,7 @@ export const usageDataColumns = computed(() => ([
     key: 'createdAtDisplay',
     label: t('usage.fields.time'),
     kind: 'datetime',
+    width: 128,
   },
   {
     key: 'clientIp',
@@ -91,7 +92,6 @@ export const usageRecordColumns = computed(() => (defineTableColumns<UsageListRe
     key: 'accountPlanType',
     label: t('usage.fields.subscription'),
     kind: 'status',
-    size: 'sm',
     fixedWidth: true,
   },
   {

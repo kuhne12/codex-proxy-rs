@@ -34,6 +34,8 @@ use gateway_admin::{
     ports::store::{AdminStoreResult, ObservabilityStore, SettingsStore},
 };
 
+mod errors;
+
 #[test]
 fn external_observability_range_accepts_exactly_366_days() {
     let end = Utc::now();
@@ -1264,6 +1266,23 @@ impl ObservabilityStore for FixtureObservabilityStore {
         Ok(self.trend.lock().expect("trend").clone())
     }
 
+    async fn client_key_statistics(
+        &self,
+        _: TimeRange,
+        _: &gateway_core::policy::ClientApiKeyId,
+        _: gateway_admin::model::observability::KeyUsageMetric,
+    ) -> AdminStoreResult<gateway_admin::model::observability::KeyStatisticsOverview> {
+        Ok(Default::default())
+    }
+
+    async fn client_key_models(
+        &self,
+        _: TimeRange,
+        _: &gateway_core::policy::ClientApiKeyId,
+    ) -> AdminStoreResult<Vec<gateway_admin::model::observability::KeyModelRow>> {
+        Ok(Default::default())
+    }
+
     async fn usage_trend(
         &self,
         _: TimeRange,
@@ -1412,6 +1431,8 @@ impl SettingsStore for FixtureSettingsStore {
             rotation_strategy: RotationStrategy::Smart,
             updated_at: Utc::now(),
             values: gateway_admin::model::settings::RuntimeSettingsValues {
+                openai_oauth_guardian_review_model: false,
+                openai_request_country: Default::default(),
                 codex_privacy_policy: Default::default(),
                 request_location_enabled: false,
                 request_location: Default::default(),
@@ -1420,7 +1441,9 @@ impl SettingsStore for FixtureSettingsStore {
                 max_concurrent_per_account: self.max_concurrent_per_account,
                 max_waiting_per_key: 0,
                 max_waiting_per_account: 0,
-                concurrency_wait_timeout_seconds: 30,
+                key_queue_timeout_seconds: 30,
+                account_queue_timeout_seconds: 30,
+                switch_account_on_queue_failure: false,
                 max_retry_after_seconds: 240,
                 openai_guardian_reserved_concurrency: 0,
                 openai_account_affinity: gateway_core::account::AccountAffinity::Relaxed,
@@ -1428,6 +1451,7 @@ impl SettingsStore for FixtureSettingsStore {
                 openai_session_affinity_ttl_hours: 24,
                 responses_max_decompressed_body_bytes: 64 * 1024 * 1024,
                 smart_scheduling: gateway_core::account::SmartSchedulingConfig::default(),
+                quota_reset_window_weights: gateway_core::account::ResetWindowWeights::default(),
                 min_codex_desktop_version: None,
                 min_codex_cli_version: None,
                 usage_retention_days: 31,
@@ -1435,9 +1459,10 @@ impl SettingsStore for FixtureSettingsStore {
                 audit_retention_days: 30,
                 account_error_protection: gateway_core::account::AccountErrorProtection::default(),
                 account_warmup_enabled: false,
-                account_warmup_schedule_time: "08:00".to_owned(),
+                account_warmup_cron: "0 8 * * *".to_owned(),
                 account_warmup_model: None,
                 reset_credit_lead_minutes: 10,
+                reset_credit_on_low_weekly_quota: false,
                 reset_credit_max_weekly_remaining_percent: None,
             },
         })
@@ -1517,6 +1542,7 @@ fn total_record(
 ) -> UsageListRecord {
     UsageListRecord {
         provider_account_upstream_peer: None,
+        has_upstream_error: false,
         error_code: None,
         error_message: None,
         error_kind: None,
@@ -1525,6 +1551,7 @@ fn total_record(
         upstream_connection_exit_reason: None,
         recovered: false,
         client_status_code: None,
+        upstream_status_code: None,
         outcome: gateway_admin::model::observability::RequestOutcome::Succeeded,
         client_api_key_name: Some("Production".to_owned()),
         id: id.to_owned(),

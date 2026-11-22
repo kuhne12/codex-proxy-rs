@@ -255,7 +255,7 @@ impl Stream for TestSocket {
 
     fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let event = self.incoming.poll_recv(context);
-        // 模拟 Axum transport 的自动 Pong；pump 不再重复实现协议层应答
+        // 模拟 Axum 传输层收到 Ping 时自动回复 Pong
         if let Poll::Ready(Some(Ok(Message::Ping(payload)))) = &event {
             self.written
                 .send(Message::Pong(payload.clone()))
@@ -643,7 +643,7 @@ async fn dropping_the_connection_aborts_and_drops_the_socket_owner() {
     assert!(cancellation.is_cancelled());
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn idle_connection_reaches_the_official_limit_without_starting_an_execution() {
     let trace = Arc::new(AtomicFailureTrace::default());
     let execution = Arc::new(AtomicFailureExecution {
@@ -672,8 +672,11 @@ async fn idle_connection_reaches_the_official_limit_without_starting_an_executio
     let (mut socket, response) = connect_async(request).await.expect("upgrade WebSocket");
     assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
 
+    // 真实 socket 读写期间使用实时时钟，避免 I/O 等待自动耗尽虚拟期限
+    tokio::time::pause();
     tokio::time::advance(Duration::from_secs(60 * 60)).await;
     tokio::task::yield_now().await;
+    tokio::time::resume();
     let text = loop {
         let message = tokio::time::timeout(Duration::from_secs(1), socket.next())
             .await
@@ -847,6 +850,7 @@ async fn start_active_response_with(
     let app = if let Some(plan) = plan {
         let admin = crate::admin::AdminTestFixture::new().await;
         gateway_api::initialize(
+            uuid::Uuid::nil(),
             gateway_api::ApiConfig {
                 asset_directory: std::env::temp_dir(),
                 cors_allowed_origins: Vec::new(),

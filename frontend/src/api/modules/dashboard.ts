@@ -156,16 +156,14 @@ export interface DashboardAccountUsage {
   usageWindow: AccountQuotaWindow | null
   metric: 'requests' | 'tokens'
   metricValueRaw: number | null
-  metricLabel: string
-  metricValue: string
   lastUsedAt: string | null
   lastUsedRelative: RelativeTimeView | null
-  lastUsed: string
 }
 
 export interface DashboardPoolSummary {
   total: number
   normal: number
+  quotaPaused: number
   quotaExhausted: number
   rateLimited: number
   disabled: number

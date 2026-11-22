@@ -289,6 +289,21 @@ async fn exact_continuation_reuses_owning_socket_after_connection_profile_update
         profile.clone(),
     )
     .with_websocket_pool(Arc::new(CodexWebSocketPool::new(Duration::from_mins(1))));
+    let account = |user: &str| {
+        use gateway_core::account::{CredentialRevision, ProviderAccount, ProviderAccountId};
+        ProviderAccount::new(
+            ProviderAccountId::new("acct_shared_slot").unwrap(),
+            gateway_core::routing::ProviderKind::new("openai").unwrap(),
+            String::new(),
+            Some(user.to_owned()),
+            "oauth".to_owned(),
+            CredentialRevision::new(1).unwrap(),
+            None,
+        )
+        .with_profile(None, Some("chatgpt-account".into()), None)
+    };
+    let replacement = backend.for_account(&account("user-b")).unwrap();
+    let backend = backend.for_account(&account("user-a")).unwrap();
     let first_request = pooled_websocket_request("wire-profile-continuation");
     let first = backend
         .create_response(
@@ -309,6 +324,16 @@ async fn exact_continuation_reuses_owning_socket_after_connection_profile_update
     let mut continuation = first_request;
     continuation.set_previous_response_id(Some("resp_connection_local".to_owned()));
     continuation.previous_response_scope = Some(PreviousResponseScope::ConnectionLocal);
+    assert!(
+        replacement
+            .create_response(
+                &continuation,
+                request_context("req_reauthorized", Some("chatgpt-account"))
+            )
+            .await
+            .is_err(),
+        "同一工作区的另一个用户不能续用旧账号的连接"
+    );
     let changed_installation = backend
         .create_response(
             &continuation,
@@ -957,8 +982,7 @@ async fn websocket_pool_should_release_slot_when_client_drops_stream() {
             .contains("streaming has begun")
     );
 
-    // 客户端断开：drop stream → rx 被 drop → tx.closed() 完成 →
-    // 代理丢弃上游连接并释放 slot（不再等 idle 超时）
+    // 客户端丢弃响应流会触发上游连接关闭，池槽位在空闲超时前释放
     drop(stream);
     tokio::time::sleep(Duration::from_millis(200)).await;
 

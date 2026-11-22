@@ -182,6 +182,52 @@ fn body_operation(body: &Value) -> Operation {
 }
 
 #[test]
+fn messages_capability_declaration_rechecks_native_body_and_keeps_input_requirements() {
+    use gateway_core::{engine::middleware::MiddlewareCapabilityDeclaration, operation::Feature};
+    let original = json!({"max_tokens":0,"messages":[{"role":"user","content":[{"type":"image","source":{"type":"url","url":"https://example.test/image.png"}}]}],"thinking":{"type":"enabled","budget_tokens":1024},"tools":[{"name":"lookup","input_schema":{"type":"object"}}]});
+    let mut converted = original.clone();
+    converted.as_object_mut().unwrap().remove("thinking");
+    let request = MiddlewareRequest::new(
+        "anthropic",
+        vec![],
+        serde_json::to_vec(&original).unwrap().into(),
+    )
+    .replace_parts(
+        "anthropic".into(),
+        vec![],
+        serde_json::to_vec(&converted).unwrap().into(),
+        Some(MiddlewareCapabilityDeclaration {
+            handled: [Feature::Reasoning].into(),
+            required: Default::default(),
+        }),
+    )
+    .unwrap();
+    let operation = request
+        .apply_capabilities(Operation::Generate(GenerateRequest::from_protocol_payload(
+            ProtocolPayload::json_object("anthropic", converted.as_object().unwrap().clone())
+                .unwrap(),
+        )))
+        .unwrap();
+    assert_eq!(
+        operation.capability_requirements().features(),
+        &[Feature::Tools, Feature::Vision].into()
+    );
+    assert!(
+        request
+            .replace_parts(
+                "openai".into(),
+                vec![],
+                Bytes::from_static(b"{}"),
+                Some(MiddlewareCapabilityDeclaration {
+                    handled: [Feature::Tools].into(),
+                    required: Default::default()
+                })
+            )
+            .is_err()
+    );
+}
+
+#[test]
 fn capability_declaration_preserves_original_semantics_and_recomputes_upstream_needs() {
     use gateway_core::{engine::middleware::MiddlewareCapabilityDeclaration, operation::Feature};
     let original = json!({"model":"gpt-test","input":"answer", "tools":[{"type":"function"}],
@@ -690,31 +736,43 @@ impl MiddlewarePlan for AddingImageTool {
 }
 
 #[test]
-fn attempt_middleware_cannot_add_image_generation_to_a_denied_scope() {
+fn attempt_middleware_cannot_add_a_group_denied_feature() {
     use gateway_core::account::{AccountSelectionPolicy, RotationStrategy};
     use gateway_core::engine::{AccountAttemptContext, AttemptContext, RequestAttemptContext};
     use gateway_core::error::ProviderErrorKind;
     use gateway_core::routing::{ClientRoutingScope, FrozenAccountScope, RuntimeAccountDirectory};
     use gateway_core::upstream::UpstreamSendState;
 
-    for allowed in [false, true] {
+    for (allowed, image) in [(true, true), (false, true), (true, false), (false, false)] {
         let scope = FrozenAccountScope::new(
             Arc::new(RuntimeAccountDirectory::new(Default::default())),
             ClientRoutingScope::all_accounts(),
         )
-        .with_image_generation(allowed);
-        let request = RequestAttemptContext::new(
-            ModelRequestId::new("req_image_policy").unwrap(),
-            ClientApiKeyId::new("key_image_policy").unwrap(),
-        )
-        .with_middleware(
-            Some(FrozenMiddlewarePlan::new(
+        .with_image_generation(!image || allowed)
+        .with_subagents(image || allowed);
+        let plan = if image {
+            FrozenMiddlewarePlan::new(
                 Arc::new(AddingImageTool),
                 ExtensionSetReference::new(
                     ExtensionSetId::new("image-policy-test".to_owned()).unwrap(),
                     Arc::new(ReadyGeneration),
                 ),
-            )),
+            )
+        } else {
+            header_plan(
+                "subagent-policy-test",
+                vec![MiddlewareHeader::new(
+                    "x-openai-subagent",
+                    Bytes::from_static(b"collab_spawn"),
+                )],
+            )
+        };
+        let request = RequestAttemptContext::new(
+            ModelRequestId::new("req_group_permissions").unwrap(),
+            ClientApiKeyId::new("key_group_permissions").unwrap(),
+        )
+        .with_middleware(
+            Some(plan),
             Arc::from([]),
             "/v1/responses".into(),
             ClientTransport::HttpJson,
@@ -736,9 +794,17 @@ fn attempt_middleware_cannot_add_image_generation_to_a_denied_scope() {
             ProviderKind::new("openai").unwrap(),
             Some("gpt-test".into()),
             ProviderAccountId::new("acct_middleware").unwrap(),
-            Box::new(move |operation, _| {
+            Box::new(move |operation, headers| {
                 Box::pin(async move {
-                    assert!(operation.image_generation_requested());
+                    if image {
+                        assert!(operation.image_generation_requested());
+                    } else {
+                        assert!(
+                            headers
+                                .iter()
+                                .any(|header| header.name() == "x-openai-subagent")
+                        );
+                    }
                     count.fetch_add(1, Ordering::SeqCst);
                     Ok(empty_provider_stream())
                 })
@@ -750,10 +816,19 @@ fn attempt_middleware_cannot_add_image_generation_to_a_denied_scope() {
         } else {
             let error = match result {
                 Err(error) => error,
-                Ok(_) => panic!("image tool must be denied"),
+                Ok(_) => panic!("group feature must be denied"),
             };
             assert_eq!(error.kind(), ProviderErrorKind::RequestPolicyDenied);
             assert_eq!(error.send_state(), UpstreamSendState::NotSent);
+            let gateway = gateway_core::error::GatewayError::from_provider(&error);
+            assert_eq!(
+                gateway.client_error_code(),
+                Some(if image {
+                    "image_generation_disabled"
+                } else {
+                    "subagents_disabled"
+                })
+            );
             assert!(error.retry_is_prohibited());
         }
     }

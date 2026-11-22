@@ -14,6 +14,39 @@ fn loaded_credential_from_record(
 
 #[async_trait]
 impl ProviderAccountStore for PgProviderAccountRepository {
+    async fn load_quota_warmup_state(
+        &self,
+        account: &CoreProviderAccount,
+    ) -> Result<Option<gateway_core::account::QuotaWarmupState>, CoreStoreError> {
+        self.load_warmup_state(account)
+            .await
+            .map_err(core_store_error)
+    }
+
+    async fn compare_and_swap_quota_warmup_state(
+        &self,
+        update: gateway_core::account::QuotaWarmupStateUpdate<'_>,
+    ) -> Result<bool, CoreStoreError> {
+        self.write_warmup_state(update)
+            .await
+            .map_err(core_store_error)
+    }
+
+    async fn load_account_catalogs(
+        &self,
+        provider: &ProviderKind,
+    ) -> Result<Vec<gateway_core::account::StoredAccountCatalog>, CoreStoreError> {
+        self.load_model_catalogs(provider).await
+    }
+
+    async fn save_account_catalog(
+        &self,
+        observation: &gateway_core::account::AccountCatalogObservation,
+        document: &[u8],
+    ) -> Result<bool, CoreStoreError> {
+        self.save_model_catalog(observation, document).await
+    }
+
     async fn create_account(&self, account: CoreNewProviderAccount) -> Result<(), CoreStoreError> {
         if account.account.revision().get() != 1 {
             return Err(CoreStoreError::new(CoreStoreErrorKind::InvalidData));
@@ -88,6 +121,29 @@ impl ProviderAccountStore for PgProviderAccountRepository {
             .collect()
     }
 
+    async fn list_catalog_candidates(
+        &self,
+        provider: &ProviderKind,
+        accounts: &[CoreProviderAccountId],
+        omissions: &gateway_core::account::AccountCatalogOmissions,
+    ) -> Result<Vec<CoreProviderAccount>, CoreStoreError> {
+        let ids = accounts
+            .iter()
+            .map(CoreProviderAccountId::as_str)
+            .collect::<Vec<_>>();
+        self.list_provider_account_summaries(
+            Some(provider.as_str()),
+            false,
+            Some(&ids),
+            Some(omissions),
+        )
+        .await
+        .map_err(core_store_error)?
+        .into_iter()
+        .map(core_account_from_summary)
+        .collect()
+    }
+
     async fn list_for_provider_accounts(
         &self,
         provider: &ProviderKind,
@@ -100,12 +156,17 @@ impl ProviderAccountStore for PgProviderAccountRepository {
             .iter()
             .map(CoreProviderAccountId::as_str)
             .collect::<Vec<_>>();
-        self.list_provider_account_summaries(Some(provider.as_str()), false, Some(&account_ids))
-            .await
-            .map_err(core_store_error)?
-            .into_iter()
-            .map(core_account_from_summary)
-            .collect()
+        self.list_provider_account_summaries(
+            Some(provider.as_str()),
+            false,
+            Some(&account_ids),
+            None,
+        )
+        .await
+        .map_err(core_store_error)?
+        .into_iter()
+        .map(core_account_from_summary)
+        .collect()
     }
 
     async fn list_refresh_candidates(
@@ -170,6 +231,7 @@ impl ProviderAccountStore for PgProviderAccountRepository {
             expected_revision,
             profile,
             preserve_profile,
+            preserve_access_token_expiry,
             credential,
             has_refresh_token,
             access_token_expires_at,
@@ -203,11 +265,12 @@ impl ProviderAccountStore for PgProviderAccountRepository {
              set name = case when $14 then name else $3 end,
                  email = case when $14 then email else $4 end,
                  plan_type = case when $14 then plan_type else $5 end,
-                 provider_quota_json = case when $14 then provider_quota_json else null end,
+                 quota_warmup_state = case when $14 then quota_warmup_state else '{}'::jsonb end, quota_warmup_revision = quota_warmup_revision + 1, provider_quota_json = case when $14 then provider_quota_json else null end, quota_paused = case when $14 then quota_paused else false end,
                  quota_observed_at = case when $14 then quota_observed_at else null end,
                  provider_credentials_json = $6,
                  credential_revision = credential_revision + 1,
-                 has_refresh_token = $7, access_token_expires_at = $8,
+                 has_refresh_token = $7,
+                 access_token_expires_at = case when $15 then access_token_expires_at else $8 end,
                  next_refresh_at = $9,
                  credential_state = case
                    when $10::text is not null
@@ -239,6 +302,7 @@ impl ProviderAccountStore for PgProviderAccountRepository {
         .bind(error_reason)
         .bind(message)
         .bind(preserve_profile)
+        .bind(preserve_access_token_expiry)
         .fetch_optional(&self.pool)
         .await
         .map_err(|source| CoreStoreError::caused_by(CoreStoreErrorKind::Unavailable, source))?;
@@ -338,6 +402,7 @@ impl ProviderAccountStore for PgProviderAccountRepository {
                 )
                 .ok_or_else(|| CoreStoreError::new(CoreStoreErrorKind::InvalidData))?;
                 Ok(QuotaObservation {
+                    quota_pause: None,
                     expected_connection: None,
                     plan_type: row.try_get("plan_type").map_err(|source| {
                         CoreStoreError::caused_by(CoreStoreErrorKind::InvalidData, source)
@@ -404,6 +469,27 @@ impl ProviderAccountStore for PgProviderAccountRepository {
         } else {
             QuotaWriteOutcome::Conflict
         })
+    }
+
+    async fn expire_access_token(
+        &self,
+        account: &CoreProviderAccount,
+        observed_at: std::time::SystemTime,
+    ) -> Result<bool, CoreStoreError> {
+        let result = sqlx::query(
+            "update provider_accounts
+             set access_token_expires_at = least(access_token_expires_at, $3),
+                 updated_at = greatest(now(), updated_at, $3)
+             where id = $1 and credential_revision = $2
+               and (credential_observed_at is null or credential_observed_at <= $3)",
+        )
+        .bind(account.id().as_str())
+        .bind(to_i64(account.revision().get()).map_err(core_store_error)?)
+        .bind(DateTime::<Utc>::from(observed_at))
+        .execute(&self.pool)
+        .await
+        .map_err(|source| CoreStoreError::caused_by(CoreStoreErrorKind::Unavailable, source))?;
+        Ok(result.rows_affected() == 1)
     }
 
     async fn apply_state_change(&self, change: AccountStateChange) -> Result<(), CoreStoreError> {

@@ -1,7 +1,7 @@
 import type { RequestOptions } from '../../request'
 import type { RequestLocation, RequestLocationDetection } from '../../types/location'
 import type { CodexPrivacyPolicy } from './privacy'
-import type { ClientProfileSelection, ProviderRequestProfiles, ProviderRequestProfileUpdates, XaiClientProfileSelection } from './profiles'
+import type { ProviderRequestProfiles, ProviderRequestProfileUpdates } from './profiles'
 import type { AccountErrorProtection } from './protection'
 import request from '../../request'
 
@@ -23,6 +23,12 @@ export type AccountAffinity = 'relaxed' | 'preferred' | 'strict'
 
 export type RotationStrategy = 'smart' | 'quota_reset_priority' | 'round_robin' | 'sticky'
 
+export interface ResetWindowWeights {
+  fiveHour: number
+  weekly: number
+  monthly: number
+}
+
 export interface SmartSchedulingConfig {
   loadWeight: number
   quotaWeight: number
@@ -30,19 +36,26 @@ export interface SmartSchedulingConfig {
   latencyWeight: number
   resetWeight: number
   queueWeight: number
+  resetWindowWeights: ResetWindowWeights
 }
+
+export type OpenAiRequestCountry
+  = | { mode: 'default' | 'passthrough' | 'follow_location' }
+    | { mode: 'custom', country: string }
 
 export interface RuntimeSettings {
   configRevision: number
   smartScheduling: SmartSchedulingConfig
   smartSchedulingDefaults: SmartSchedulingConfig
+  quotaResetWindowWeights: ResetWindowWeights
+  quotaResetWindowWeightsDefaults: ResetWindowWeights
   providerRequestProfiles: ProviderRequestProfiles
-  openaiClientProfile: ClientProfileSelection | null
-  xaiClientProfile: XaiClientProfileSelection | null
 
   codexPrivacyPolicy: CodexPrivacyPolicy
+  openaiRequestCountry: OpenAiRequestCountry
   requestLocationEnabled: boolean
   requestLocation: RequestLocation
+  openaiOauthGuardianReviewModel: boolean
   modelMappings: Record<string, string>
   refreshMarginSeconds: number
   refreshConcurrency: number
@@ -53,7 +66,9 @@ export interface RuntimeSettings {
   openaiSessionAffinityTtlHours: number
   maxWaitingPerKey: number
   maxWaitingPerAccount: number
-  concurrencyWaitTimeoutSeconds: number
+  keyQueueTimeoutSeconds: number
+  accountQueueTimeoutSeconds: number
+  switchAccountOnQueueFailure: boolean
   maxRetryAfterSeconds: number
   responsesMaxDecompressedBodyBytes: number
   rotationStrategy: RotationStrategy
@@ -64,8 +79,9 @@ export interface RuntimeSettings {
   auditRetentionDays: number
   accountErrorProtection: AccountErrorProtection
   accountWarmupEnabled: boolean
-  accountWarmupScheduleTime: string
+  accountWarmupCron: string
   accountWarmupModel: string | null
+  resetCreditOnLowWeeklyQuota: boolean
   resetCreditLeadMinutes: number
   resetCreditMaxWeeklyRemainingPercent: number | null
   updatedAt: string
@@ -114,7 +130,7 @@ export function getSettings(options: RequestOptions = {}) {
   })
 }
 
-type UpdateSettingsParam = Omit<RuntimeSettings, 'updatedAt' | 'updatedAtDisplay' | 'smartSchedulingDefaults' | 'openaiClientProfile' | 'xaiClientProfile' | 'providerRequestProfiles'> & {
+type UpdateSettingsParam = Omit<RuntimeSettings, 'updatedAt' | 'updatedAtDisplay' | 'smartSchedulingDefaults' | 'quotaResetWindowWeightsDefaults' | 'providerRequestProfiles'> & {
   providerRequestProfiles: ProviderRequestProfileUpdates
 }
 

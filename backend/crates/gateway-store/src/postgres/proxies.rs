@@ -321,7 +321,7 @@ async fn lock_url(
     Ok(())
 }
 
-/// 导入和旧版 URL 写入在账号事务内登记到共享代理目录
+/// 按 URL 复用代理条目，与账号导入或代理创建共用事务
 pub(crate) async fn ensure_proxy_for_url(
     transaction: &mut Transaction<'_, Postgres>,
     proxy: &OutboundProxy,
@@ -350,10 +350,6 @@ pub(crate) async fn resolve_proxy_selection(
 ) -> StoreResult<(Option<String>, Option<OutboundProxy>)> {
     match selection {
         AccountProxySelection::Direct => Ok((None, None)),
-        AccountProxySelection::Url(proxy) => {
-            let (id, _) = ensure_proxy_for_url(transaction, proxy, None).await?;
-            Ok((Some(id), Some(proxy.clone())))
-        }
         AccountProxySelection::Saved(id) => {
             let (value, enabled, limit): (String, bool, i64) = sqlx::query_as(
                 "select proxy_url, enabled, max_websocket_connections from outbound_proxies where id = $1 for share",
@@ -424,7 +420,8 @@ impl ProxyStore for PgProxyRepository {
         // 在同一条更新中校验绑定，避免旧弹窗清除账号后来选择的其他代理
         let updated = sqlx::query(
             "update provider_accounts
-             set outbound_proxy_id = null, outbound_proxy_url = null, provider_quota_json = null, quota_observed_at = null,
+             set outbound_proxy_id = null, outbound_proxy_url = null,
+                 (provider_quota_json, quota_observed_at) = (select provider_quota_json, quota_observed_at where quota_paused),
                  updated_at = greatest(now(), updated_at)
              where id = $1 and outbound_proxy_id = $2",
         )
@@ -802,7 +799,11 @@ impl ProxyStore for PgProxyRepository {
                 .await
                 .map_err(store_error)?;
         }
-        sqlx::query("update provider_accounts a set outbound_proxy_url = p.proxy_url, provider_quota_json = null, quota_observed_at = null, updated_at = case when a.outbound_proxy_url is distinct from p.proxy_url or a.provider_quota_json is not null then greatest(now(), a.updated_at) else a.updated_at end from outbound_proxies p where p.id = $1 and a.outbound_proxy_id = p.id and (a.outbound_proxy_url is distinct from p.proxy_url or $2)")
+        sqlx::query("update provider_accounts a set outbound_proxy_url = p.proxy_url,
+            (provider_quota_json, quota_observed_at) = (select a.provider_quota_json, a.quota_observed_at where a.quota_paused),
+            updated_at = case when a.outbound_proxy_url is distinct from p.proxy_url or a.provider_quota_json is not null
+                then greatest(now(), a.updated_at) else a.updated_at end
+            from outbound_proxies p where p.id = $1 and a.outbound_proxy_id = p.id and (a.outbound_proxy_url is distinct from p.proxy_url or $2)")
             .bind(&command.id).bind(enabled_changed).execute(&mut *transaction).await.map_err(|source| store_error(unavailable(source)))?;
         audit(
             &mut transaction,
@@ -866,7 +867,8 @@ impl ProxyStore for PgProxyRepository {
             return Err(store_error(error));
         }
         let account_ids: Vec<String> = sqlx::query_scalar(
-            "update provider_accounts set outbound_proxy_id = null, outbound_proxy_url = null, provider_quota_json = null, quota_observed_at = null,
+            "update provider_accounts set outbound_proxy_id = null, outbound_proxy_url = null,
+             (provider_quota_json, quota_observed_at) = (select provider_quota_json, quota_observed_at where quota_paused),
              updated_at = greatest(now(), updated_at) where outbound_proxy_id = $1 returning id",
         )
         .bind(id)

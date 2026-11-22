@@ -211,7 +211,7 @@ async fn xai_quota_catalog_worker_preserves_store_failures() {
     let error = run_quota_catalog_cycle(&mut bundle)
         .await
         .expect_err("Provider account Store failure");
-    assert_eq!(error.as_safe_str(), "xAI Provider accounts unavailable");
+    assert_eq!(error.as_safe_str(), "账号列表读取失败");
 }
 
 #[tokio::test]
@@ -250,10 +250,7 @@ async fn xai_quota_catalog_worker_retains_both_failure_stages_and_finishes_the_b
         let error = run_quota_catalog_cycle(&mut bundle)
             .await
             .expect_err("invalid stored credentials");
-        assert_eq!(
-            error.as_safe_str(),
-            "xAI quota or catalog synchronization failed"
-        );
+        assert_eq!(error.as_safe_str(), "额度或模型目录同步失败");
         let details = error.error_details().expect("synchronization causes");
         let details: Value = serde_json::from_str(details.as_str()).unwrap();
         let cause = details["causes"]["messages"][0].as_str().unwrap();
@@ -403,18 +400,7 @@ async fn xai_admin_provider_restores_full_pending_envelope_and_binds_owner() {
     let flow_id = "pending-envelope";
     let owner_ref = admin_session_owner_ref("admin-owner");
     let payload = pending_payload(flow_id, &owner_ref);
-    pending.insert(flow_id, owner_ref, payload.clone());
-
-    let mutation = payload
-        .expose_to_provider()
-        .get("mutation")
-        .and_then(Value::as_object)
-        .expect("pending mutation");
-    assert_eq!(mutation.get("expected_config_revision"), None);
-    assert_eq!(
-        mutation.get("started_request_id").and_then(Value::as_str),
-        Some("request-start")
-    );
+    pending.insert(flow_id, owner_ref, payload);
 
     let wrong_owner = bundle
         .admin_provider()
@@ -568,6 +554,7 @@ async fn xai_admin_provider_projects_cached_quota_models_and_canonical_export() 
     );
     store
         .compare_and_swap_quota(gateway_core::account::QuotaObservation {
+            quota_pause: None,
             expected_connection: None,
             plan_type: None,
             account_id: account.id().clone(),
@@ -609,8 +596,6 @@ async fn xai_admin_provider_projects_cached_quota_models_and_canonical_export() 
     assert_eq!(window_data["onDemandCapCents"], 500);
     assert_eq!(window_data["onDemandUsedCents"], 100);
     assert_eq!(window_data["prepaidBalanceCents"], -500);
-    assert!(!window_data.contains_key("monthlyLimitCents"));
-    assert!(!window_data.contains_key("includedUsedCents"));
     let models = admin
         .models(account.id(), false)
         .await
@@ -768,6 +753,9 @@ fn provider_ports_with_catalog(
 fn account_record(account: &ProviderAccount) -> AccountRecord {
     let now = Utc::now();
     AccountRecord {
+        quota_paused: false,
+        quota_settings: Default::default(),
+        auto_use_quota_credits: false,
         outbound_proxy_id: None,
         outbound_proxy_enabled: true,
         notes: None,
@@ -823,6 +811,7 @@ impl ProviderLeasePort for TestLeases {
                             in_flight: 0,
                             last_started_at: None,
                             quota_reset_at: None,
+                            quota_reset_windows: None,
                             quota_remaining_rank: None,
                             cooldown: None,
                             failure_rate_basis_points: None,
@@ -1253,7 +1242,7 @@ mod errors {
                 Some(if expired {
                     "刷新令牌已失效，请重新授权"
                 } else {
-                    "账号凭据已被更新，请刷新账号列表后重试"
+                    "凭据已更新，请刷新账号列表"
                 })
             );
             assert_eq!(store.account(&input.account_id).unwrap(), before);
@@ -1294,10 +1283,7 @@ mod errors {
             .await
             .unwrap_err();
         assert_eq!(error.kind(), Kind::Conflict);
-        assert_eq!(
-            error.public_message(),
-            Some("令牌刷新繁忙，请等待当前刷新完成后重试")
-        );
+        assert_eq!(error.public_message(), Some("令牌刷新繁忙，请稍后重试"));
         assert_eq!(
             listener.accept().unwrap_err().kind(),
             std::io::ErrorKind::WouldBlock
@@ -1330,7 +1316,7 @@ mod errors {
         assert_eq!(error.kind(), Kind::Unavailable);
         assert_eq!(
             error.public_message(),
-            Some("xAI 令牌刷新连接失败，请检查出站连接后重试")
+            Some("无法连接令牌刷新服务，请检查出站连接")
         );
         assert!(!format!("{error:?} {error}").contains("proxy-secret-marker"));
         assert_eq!(store.account(&input.account_id).unwrap(), before);

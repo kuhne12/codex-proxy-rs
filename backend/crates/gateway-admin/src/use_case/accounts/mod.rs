@@ -20,11 +20,13 @@ use gateway_core::{
 use crate::{
     model::{
         AdminError, MutationContext,
+        account_groups::AccountGroupRef,
         accounts::{
             AccountConnectionTestEvent, AccountConnectionTestEventStream, AccountListQuery,
             AccountPageItem, AccountUpdateResult, AccountUsage, AccountUsageWindowQuery,
             AccountsUpdateResult, BatchUpdateAccounts, UpdateAccount,
         },
+        client_keys::ClientKeyBudgetReference,
         observability::TimeRange,
         provider_credentials::{
             AccountDirectoryItem, AccountDirectoryPage, AccountExportBundle, AccountPersonalInfo,
@@ -106,6 +108,12 @@ pub trait AccountsService: Send + Sync {
         account_id: &ProviderAccountId,
         refresh: bool,
     ) -> Result<AccountDirectoryItem, AdminError>;
+
+    async fn key_budget_references(
+        &self,
+        account_id: &ProviderAccountId,
+        key_groups: &[AccountGroupRef],
+    ) -> Result<Vec<ClientKeyBudgetReference>, AdminError>;
 
     async fn quota_forecast(
         &self,
@@ -759,6 +767,8 @@ impl AccountsService for DefaultAccountsService {
             self.accounts
                 .batch_update_accounts(
                     BatchUpdateAccounts {
+                        quota_settings: None,
+                        auto_use_quota_credits: None,
                         account_ids: vec![account_id.to_string()],
                         enabled: Some(true),
                         concurrency_limit: None,
@@ -767,6 +777,7 @@ impl AccountsService for DefaultAccountsService {
                         group_ids: None,
                         outbound_proxy: None,
                     },
+                    Default::default(),
                     context,
                 )
                 .await
@@ -837,23 +848,86 @@ impl AccountsService for DefaultAccountsService {
             (
                 std::sync::Arc<dyn crate::ports::provider::ProviderAdmin>,
                 Vec<ProviderAccountId>,
+                Vec<ProviderAccountId>,
             ),
         >::new();
+        let mut pauses = BTreeMap::new();
         for account_id in &account_ids {
-            let (item, provider) = self.provider_for_account(account_id).await?;
-            providers
+            let (mut item, provider) = self.provider_for_account(account_id).await?;
+            if let Some(settings) = &command.quota_settings {
+                if !provider
+                    .account_capabilities(account_id, &item.account.authentication_kind)
+                    .quota_settings_supported
+                {
+                    return Err(AdminError::invalid("该账号不支持额度桶设置"));
+                }
+                let previous_settings = item.account.quota_settings.clone();
+                let settings = settings.clone();
+                let mut observed_at = None;
+                let mut paused = false;
+                if !settings.is_empty() {
+                    item.account.quota_settings = settings.clone();
+                    let quota = provider
+                        .read_quotas(&[ProviderQuotaReadRequest {
+                            account: &item.account,
+                            rolling_usage: None,
+                        }])
+                        .await
+                        .into_iter()
+                        .next()
+                        .ok_or_else(|| AdminError::invalid("缺少账号额度观测结果"))?
+                        .map_err(|error| map_provider_error(error, "provider quota"))?;
+                    for key in settings.keys() {
+                        let window = quota.windows.iter().find(|window| window.key == key);
+                        if window.is_none() && !previous_settings.contains(key) {
+                            return Err(AdminError::invalid("只能设置已观测的额度桶"));
+                        }
+                        if window.is_some_and(|window| {
+                            window.local_usage_attribution
+                                != QuotaLocalUsageAttribution::AccountWide
+                        }) {
+                            return Err(AdminError::invalid("只能设置通用额度桶"));
+                        }
+                    }
+                    observed_at = quota.observed_at;
+                    paused = !quota.paused_windows.is_empty();
+                }
+                pauses.insert(
+                    item.account.id.clone(),
+                    crate::model::accounts::PreparedQuotaPause {
+                        settings,
+                        previous_settings,
+                        revision: item.account.credential_revision,
+                        observed_at,
+                        paused,
+                    },
+                );
+            }
+            if command.auto_use_quota_credits.is_some()
+                && !provider
+                    .account_capabilities(account_id, &item.account.authentication_kind)
+                    .quota_credits
+            {
+                return Err(AdminError::invalid("该账号不支持使用额度点数"));
+            }
+            let (_, selected, exhausted) = providers
                 .entry(item.account.provider_kind)
-                .or_insert_with(|| (provider, Vec::new()))
-                .1
-                .push(account_id.clone());
+                .or_insert_with(|| (provider, Vec::new(), Vec::new()));
+            selected.push(account_id.clone());
+            if command.auto_use_quota_credits == Some(true)
+                && !item.account.auto_use_quota_credits
+                && item.account.quota.is_exhausted()
+            {
+                exhausted.push(account_id.clone());
+            }
         }
         let enabled = command.enabled;
         let result = self
             .accounts
-            .batch_update_accounts(command, context)
+            .batch_update_accounts(command, pauses, context)
             .await
             .map_err(|error| map_store_error(error, "provider accounts"))?;
-        for (provider, provider_ids) in providers.values() {
+        for (provider, provider_ids, _) in providers.values() {
             if enabled == Some(false) {
                 for account_id in provider_ids {
                     super::notify_account_unavailable(
@@ -872,6 +946,18 @@ impl AccountsService for DefaultAccountsService {
             .await;
         }
         publish_committed(self.snapshot.as_ref(), result.config_revision).await?;
+        for (provider, _, exhausted) in providers.into_values() {
+            if exhausted.is_empty() {
+                continue;
+            }
+            super::credential_mutation::observe_account_quotas(
+                self.upstream_info.as_ref(),
+                &provider,
+                &self.accounts,
+                &exhausted,
+                context.request_id.as_str(),
+            );
+        }
         Ok(result)
     }
 
@@ -892,6 +978,48 @@ impl AccountsService for DefaultAccountsService {
         refresh: bool,
     ) -> Result<AccountDirectoryItem, AdminError> {
         self.load_directory_item(account_id, refresh).await
+    }
+
+    async fn key_budget_references(
+        &self,
+        account_id: &ProviderAccountId,
+        key_groups: &[AccountGroupRef],
+    ) -> Result<Vec<ClientKeyBudgetReference>, AdminError> {
+        let (stored, provider) = self.provider_for_account(account_id).await?;
+        if !key_groups.is_empty()
+            && !stored.account.groups.iter().any(|account_group| {
+                account_group.enabled && key_groups.iter().any(|group| group.id == account_group.id)
+            })
+        {
+            return Err(AdminError::bad_request("参考账号不在此密钥的账号范围内"));
+        }
+        // 只取已观测的额度边界，预览与确认都不触发上游刷新或账号用量聚合
+        let quota = match super::peer_link::upstream::read_quota(
+            self.upstream_info.as_deref(),
+            provider.as_ref(),
+            &stored.account,
+            ProviderQuotaRequest {
+                account_id: account_id.clone(),
+                refresh: false,
+                rolling_usage: None,
+            },
+        )
+        .await
+        {
+            Ok(quota) => quota,
+            Err(error)
+                if error.kind() == crate::ports::provider::ProviderAdminErrorKind::Unsupported =>
+            {
+                return Ok(Vec::new());
+            }
+            Err(error) => return Err(map_provider_error(error, "provider quota")),
+        };
+        let now = Utc::now();
+        Ok(quota
+            .windows
+            .into_iter()
+            .filter_map(|window| ClientKeyBudgetReference::from_current_window(window, now))
+            .collect())
     }
 
     async fn quota_forecast(
@@ -929,6 +1057,8 @@ impl AccountsService for DefaultAccountsService {
             ) else {
                 continue;
             };
+            let reset_at = query.range.end;
+            let window_duration = reset_at - query.range.start;
             query.range.start = query.range.start.max(stored.account.created_at);
             if query.range.start >= observed
                 || observed > now
@@ -938,7 +1068,6 @@ impl AccountsService for DefaultAccountsService {
             {
                 continue;
             }
-            let reset_at = query.range.end;
             query.range.end = observed;
             let history = self
                 .accounts
@@ -946,27 +1075,37 @@ impl AccountsService for DefaultAccountsService {
                 .await
                 .map_err(|error| map_store_error(error, "forecast paired usage"))?;
             let mut points = Vec::new();
-            let mut interrupted = false;
+            let mut plan_changed = false;
             for point in history.points {
                 let Some(fact) =
                     provider.quota_forecast_observation(&point.provider_observation, window)
                 else {
                     continue;
                 };
-                let same_plan = quota
-                    .plan_type
-                    .as_deref()
-                    .zip(fact.plan_type.as_deref())
-                    .is_some_and(|(current, previous)| current.eq_ignore_ascii_case(previous));
-                // 仅容纳已观测到的秒级量化抖动，不用宽时间容差合并实际重置
-                // 不匹配的段截断基线；之后的有效观测可以重新积累
-                if !same_plan || (fact.reset_at - reset_at).abs() > Duration::seconds(2) {
+                let (Some(current_plan), Some(previous_plan)) =
+                    (quota.plan_type.as_deref(), fact.plan_type.as_deref())
+                else {
+                    continue;
+                };
+                let Some(start) = fact.reset_at.checked_sub_signed(window_duration) else {
+                    continue;
+                };
+                if point.completed_at >= observed
+                    || point.started_at < query.range.start
+                    || point.completed_at < start
+                    || point.completed_at >= fact.reset_at
+                {
+                    continue;
+                }
+                if !current_plan.eq_ignore_ascii_case(previous_plan) {
                     points.clear();
-                    interrupted = true;
+                    plan_changed = true;
                     continue;
                 }
                 points.push(QuotaForecastPoint {
+                    started_at: point.started_at,
                     observed_at: point.completed_at,
+                    reset_at: fact.reset_at,
                     used_percent: fact.used_percent,
                     usage: point.usage,
                 });
@@ -975,13 +1114,15 @@ impl AccountsService for DefaultAccountsService {
                 window.key.clone(),
                 query.range.start,
                 QuotaForecastPoint {
+                    started_at: observed,
                     observed_at: observed,
+                    reset_at,
                     used_percent: percent,
                     usage: history.usage,
                 },
                 points,
                 history.pending_request_count,
-                interrupted,
+                plan_changed,
             );
             samples.push(sample);
         }
@@ -1188,6 +1329,7 @@ impl AccountsService for DefaultAccountsService {
                     vec![AccountConnectionTestEvent::Failed {
                         source: error.source(),
                         gateway_error_code: error.kind(),
+                        proxy_hint: error.proxy_hint(),
                         send_state: error.send_state(),
                         message,
                         provider_error_code: error.client_error_code().map(ToOwned::to_owned),
@@ -1225,9 +1367,7 @@ fn quota_usage_window(
     if window.local_usage_attribution != QuotaLocalUsageAttribution::AccountWide {
         return None;
     }
-    let reset_at = window.reset_at?;
-    let seconds = i64::try_from(window.window_seconds?).ok()?;
-    let start = reset_at.checked_sub_signed(Duration::try_seconds(seconds)?)?;
+    let (start, reset_at) = window.observed_bounds()?;
     let range = TimeRange::new(start, reset_at).ok()?;
     // 上游百分比以该 reset 边界定义；以当前时间回推会让本地 Token 属于另一窗口
     Some(AccountUsageWindowQuery {

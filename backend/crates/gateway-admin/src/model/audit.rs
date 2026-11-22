@@ -16,6 +16,7 @@ pub enum MutationAuditOperation {
     AccountGroupEnabled { enabled: bool },
     AccountGroupDelete,
     ClientApiKeyResetBudget,
+    ClientApiKeySetBudgetWindow,
     ProviderAccountUpdate,
     BackupStorageUpdate,
     BackupScheduleUpdate,
@@ -35,6 +36,7 @@ pub enum MutationAuditOperation {
     PluginSourceCredentialCreate,
     PluginSourceCredentialDelete,
     ClientApiKeyUpdateBudgetLimits,
+    ClientApiKeyBatchUpdate,
     ClientApiKeyCreate,
     ClientApiKeyUpdate,
     ClientApiKeyEnabled { enabled: bool },
@@ -76,6 +78,7 @@ impl MutationAuditOperation {
             }
             Self::AccountGroupDelete => ("delete", "account_group"),
             Self::ClientApiKeyResetBudget => ("reset_budget", "client_api_key"),
+            Self::ClientApiKeySetBudgetWindow => ("set_budget_window", "client_api_key"),
             Self::ProviderAccountUpdate => ("update", "provider_account"),
             Self::BackupStorageUpdate => ("backup.s3_config_updated", "backup_settings"),
             Self::BackupScheduleUpdate => ("backup.schedule_updated", "backup_settings"),
@@ -95,6 +98,7 @@ impl MutationAuditOperation {
             Self::PluginSourceCredentialCreate => ("create", "plugin_source_credential"),
             Self::PluginSourceCredentialDelete => ("delete", "plugin_source_credential"),
             Self::ClientApiKeyUpdateBudgetLimits => ("update_budget_limits", "client_api_key"),
+            Self::ClientApiKeyBatchUpdate => ("batch_update", "client_api_key"),
             Self::ClientApiKeyCreate => ("create", "client_api_key"),
             Self::ClientApiKeyUpdate => ("update", "client_api_key"),
             Self::ClientApiKeyEnabled { enabled } => {

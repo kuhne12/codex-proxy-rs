@@ -118,7 +118,6 @@ pub struct StartAccountAuthorizationRequest {
     pub provider: String,
     pub name: String,
     pub account_id: Option<String>,
-    pub outbound_proxy_url: Option<super::wire::AccountProxyUpdate>,
 }
 
 impl StartAccountAuthorizationRequest {
@@ -148,10 +147,7 @@ impl StartAccountAuthorizationRequest {
                 context,
                 name: self.name.trim().to_owned(),
                 reauthorization,
-                outbound_proxy: super::wire::proxy_selection(
-                    self.outbound_proxy_id,
-                    self.outbound_proxy_url,
-                )?,
+                outbound_proxy: super::wire::proxy_selection(self.outbound_proxy_id)?,
             },
         ))
     }
@@ -219,7 +215,6 @@ fn validate_authorization_flow(
 pub struct UpdateAccountRequest {
     pub connection: Option<AccountConnectionUpdateRequest>,
     pub outbound_proxy_id: Option<String>,
-    pub outbound_proxy_url: Option<super::wire::AccountProxyUpdate>,
     pub account_id: String,
     pub name: Option<String>,
     pub notes: Option<String>,
@@ -255,10 +250,7 @@ impl UpdateAccountRequest {
             .connection
             .map(AccountConnectionUpdateRequest::into_document);
         let settings = UpdateAccount {
-            outbound_proxy: super::wire::proxy_selection(
-                self.outbound_proxy_id,
-                self.outbound_proxy_url,
-            )?,
+            outbound_proxy: super::wire::proxy_selection(self.outbound_proxy_id)?,
             account_id: self.account_id,
             name: self.name.map(|name| name.trim().to_owned()),
             notes: self.notes,
@@ -276,6 +268,7 @@ impl UpdateAccountRequest {
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AccountConnectionUpdateRequest {
+    pub protocol: Option<String>,
     pub base_url: Option<String>,
     pub transport: String,
     pub api_key: Option<String>,
@@ -283,6 +276,13 @@ pub struct AccountConnectionUpdateRequest {
 
 impl AccountConnectionUpdateRequest {
     fn validate(&self) -> Result<(), WireValidationError> {
+        if self
+            .protocol
+            .as_deref()
+            .is_some_and(|protocol| !matches!(protocol, "responses" | "messages"))
+        {
+            return Err(WireValidationError::new("connection.protocol"));
+        }
         if let Some(base_url) = &self.base_url {
             require_text(base_url, 2048, "connection.baseUrl")?;
         }
@@ -302,6 +302,9 @@ impl AccountConnectionUpdateRequest {
     fn into_document(self) -> ProviderDocument {
         let mut material =
             Map::from_iter([("transport".to_owned(), Value::String(self.transport))]);
+        if let Some(protocol) = self.protocol {
+            material.insert("protocol".to_owned(), Value::String(protocol));
+        }
         if let Some(base_url) = self.base_url {
             material.insert("base_url".to_owned(), Value::String(base_url));
         }

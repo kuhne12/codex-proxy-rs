@@ -136,6 +136,8 @@ pub struct PrivacyPreviewResult {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeSettings {
+    pub openai_oauth_guardian_review_model: bool,
+    pub openai_request_country: OpenAiRequestCountry,
     pub codex_privacy_policy: CodexPrivacyPolicy,
     pub request_location_enabled: bool,
     pub request_location: RequestLocation,
@@ -144,7 +146,9 @@ pub struct RuntimeSettings {
     pub max_concurrent_per_account: u32,
     pub max_waiting_per_key: u32,
     pub max_waiting_per_account: u32,
-    pub concurrency_wait_timeout_seconds: u32,
+    pub key_queue_timeout_seconds: u32,
+    pub account_queue_timeout_seconds: u32,
+    pub switch_account_on_queue_failure: bool,
     pub max_retry_after_seconds: u32,
     pub openai_guardian_reserved_concurrency: u32,
     pub openai_account_affinity: AccountAffinity,
@@ -152,6 +156,7 @@ pub struct RuntimeSettings {
     pub openai_session_affinity_ttl_hours: u32,
     pub responses_max_decompressed_body_bytes: u64,
     pub smart_scheduling: SmartSchedulingConfig,
+    pub quota_reset_window_weights: ResetWindowWeights,
     pub min_codex_desktop_version: Option<String>,
     pub min_codex_cli_version: Option<String>,
     pub usage_retention_days: u32,
@@ -159,8 +164,9 @@ pub struct RuntimeSettings {
     pub audit_retention_days: u32,
     pub account_error_protection: AccountErrorProtection,
     pub account_warmup_enabled: bool,
-    pub account_warmup_schedule_time: String,
+    pub account_warmup_cron: String,
     pub account_warmup_model: Option<String>,
+    pub reset_credit_on_low_weekly_quota: bool,
     pub reset_credit_lead_minutes: u32,
     pub reset_credit_max_weekly_remaining_percent: Option<u32>,
     pub request_profiles: ProviderRequestProfiles,
@@ -172,6 +178,8 @@ pub struct RuntimeSettings {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReplaceRuntimeSettings {
+    pub openai_oauth_guardian_review_model: bool,
+    pub openai_request_country: OpenAiRequestCountry,
     pub codex_privacy_policy: CodexPrivacyPolicy,
     pub request_location_enabled: bool,
     pub request_location: RequestLocation,
@@ -180,7 +188,9 @@ pub struct ReplaceRuntimeSettings {
     pub max_concurrent_per_account: u32,
     pub max_waiting_per_key: u32,
     pub max_waiting_per_account: u32,
-    pub concurrency_wait_timeout_seconds: u32,
+    pub key_queue_timeout_seconds: u32,
+    pub account_queue_timeout_seconds: u32,
+    pub switch_account_on_queue_failure: bool,
     pub max_retry_after_seconds: u32,
     pub openai_guardian_reserved_concurrency: u32,
     pub openai_account_affinity: AccountAffinity,
@@ -188,6 +198,7 @@ pub struct ReplaceRuntimeSettings {
     pub openai_session_affinity_ttl_hours: u32,
     pub responses_max_decompressed_body_bytes: u64,
     pub smart_scheduling: SmartSchedulingConfig,
+    pub quota_reset_window_weights: ResetWindowWeights,
     pub min_codex_desktop_version: Option<String>,
     pub min_codex_cli_version: Option<String>,
     pub usage_retention_days: u32,
@@ -195,8 +206,9 @@ pub struct ReplaceRuntimeSettings {
     pub audit_retention_days: u32,
     pub account_error_protection: AccountErrorProtection,
     pub account_warmup_enabled: bool,
-    pub account_warmup_schedule_time: String,
+    pub account_warmup_cron: String,
     pub account_warmup_model: Option<String>,
+    pub reset_credit_on_low_weekly_quota: bool,
     pub reset_credit_lead_minutes: u32,
     pub reset_credit_max_weekly_remaining_percent: Option<u32>,
     /// 读取设置时的版本；与写入在同一事务内比较，防止覆盖并发更新
@@ -239,6 +251,14 @@ pub struct RequestLocation {
     pub city: String,
     pub timezone: String,
 }
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+pub enum OpenAiRequestCountry {
+    Default {},
+    Passthrough {},
+    FollowLocation {},
+    Custom { country: String },
+}
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SmartSchedulingConfig {
@@ -248,6 +268,15 @@ pub struct SmartSchedulingConfig {
     pub latency_weight: f64,
     pub reset_weight: f64,
     pub queue_weight: f64,
+    #[serde(default)]
+    pub reset_window_weights: ResetWindowWeights,
+}
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ResetWindowWeights {
+    pub five_hour: f64,
+    pub weekly: f64,
+    pub monthly: f64,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -370,6 +399,8 @@ impl Operation for PreviewClientProfile {
 impl From<RuntimeSettings> for ReplaceRuntimeSettings {
     fn from(settings: RuntimeSettings) -> Self {
         Self {
+            openai_oauth_guardian_review_model: settings.openai_oauth_guardian_review_model,
+            openai_request_country: settings.openai_request_country,
             codex_privacy_policy: settings.codex_privacy_policy,
             request_location_enabled: settings.request_location_enabled,
             request_location: settings.request_location,
@@ -378,7 +409,9 @@ impl From<RuntimeSettings> for ReplaceRuntimeSettings {
             max_concurrent_per_account: settings.max_concurrent_per_account,
             max_waiting_per_key: settings.max_waiting_per_key,
             max_waiting_per_account: settings.max_waiting_per_account,
-            concurrency_wait_timeout_seconds: settings.concurrency_wait_timeout_seconds,
+            key_queue_timeout_seconds: settings.key_queue_timeout_seconds,
+            account_queue_timeout_seconds: settings.account_queue_timeout_seconds,
+            switch_account_on_queue_failure: settings.switch_account_on_queue_failure,
             max_retry_after_seconds: settings.max_retry_after_seconds,
             openai_guardian_reserved_concurrency: settings.openai_guardian_reserved_concurrency,
             openai_account_affinity: settings.openai_account_affinity,
@@ -386,6 +419,7 @@ impl From<RuntimeSettings> for ReplaceRuntimeSettings {
             openai_session_affinity_ttl_hours: settings.openai_session_affinity_ttl_hours,
             responses_max_decompressed_body_bytes: settings.responses_max_decompressed_body_bytes,
             smart_scheduling: settings.smart_scheduling,
+            quota_reset_window_weights: settings.quota_reset_window_weights,
             min_codex_desktop_version: settings.min_codex_desktop_version,
             min_codex_cli_version: settings.min_codex_cli_version,
             usage_retention_days: settings.usage_retention_days,
@@ -393,8 +427,9 @@ impl From<RuntimeSettings> for ReplaceRuntimeSettings {
             audit_retention_days: settings.audit_retention_days,
             account_error_protection: settings.account_error_protection,
             account_warmup_enabled: settings.account_warmup_enabled,
-            account_warmup_schedule_time: settings.account_warmup_schedule_time,
+            account_warmup_cron: settings.account_warmup_cron,
             account_warmup_model: settings.account_warmup_model,
+            reset_credit_on_low_weekly_quota: settings.reset_credit_on_low_weekly_quota,
             reset_credit_lead_minutes: settings.reset_credit_lead_minutes,
             reset_credit_max_weekly_remaining_percent: settings
                 .reset_credit_max_weekly_remaining_percent,

@@ -48,8 +48,14 @@ impl Eq for CodexWebSocketConnection {}
 /// 已构造完成的 Responses WebSocket 请求描述
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodexWebSocketRequest {
-    pub(crate) connection: CodexWebSocketConnection,
+    pub(crate) opening: ResponseCreateOpening,
     pub(super) payload_text: String,
+}
+
+/// 建连与选择连接只读取路由和续接要求，原生推理帧在连接就绪后编码
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResponseCreateOpening {
+    pub(crate) connection: CodexWebSocketConnection,
     pub(super) continuation: WebSocketContinuationRequirement,
     // 仅 Codex backend 约束首包搜索初始化，API Key 的 Responses API 不采用此规则
     pub(super) codex_search_declared: Option<bool>,
@@ -102,6 +108,7 @@ pub enum PreviousResponseUnavailableReason {
     LatestResponseMismatch,
     ReusedConnectionLost,
     UpstreamRejected,
+    PayloadTooLarge,
 }
 
 impl PreviousResponseUnavailableReason {
@@ -113,6 +120,7 @@ impl PreviousResponseUnavailableReason {
             Self::ConnectionBusy => "connection_busy",
             Self::LatestResponseMismatch => "latest_response_mismatch",
             Self::ReusedConnectionLost => "reused_connection_lost",
+            Self::PayloadTooLarge => "transport_payload_too_large",
             Self::UpstreamRejected => "upstream_rejected",
         }
     }
@@ -125,38 +133,48 @@ impl fmt::Display for PreviousResponseUnavailableReason {
 }
 
 impl CodexWebSocketRequest {
-    pub(crate) fn take_payload_text(&mut self) -> String {
-        std::mem::take(&mut self.payload_text)
-    }
-
-    pub(crate) fn replace_outbound(
-        &mut self,
-        endpoint: String,
-        headers: Vec<(String, String)>,
-        payload: String,
-    ) {
-        self.connection.endpoint = endpoint;
-        self.connection.headers = headers;
-        self.payload_text = payload;
-    }
-
     /// 返回连接描述
     pub fn connection(&self) -> &CodexWebSocketConnection {
-        &self.connection
+        &self.opening.connection
     }
 
-    /// 返回将要发送的首个文本帧
+    /// 返回将要发送的完整 `response.create` 文本
     pub fn payload_text(&self) -> &str {
         &self.payload_text
     }
 
     /// 返回连接续接要求
     pub fn continuation(&self) -> &WebSocketContinuationRequirement {
-        &self.continuation
+        &self.opening.continuation
+    }
+}
+
+impl ResponseCreateOpening {
+    pub(crate) fn with_payload(self, payload_text: String) -> CodexWebSocketRequest {
+        CodexWebSocketRequest {
+            opening: self,
+            payload_text,
+        }
     }
 }
 
 impl CodexWebSocketConnection {
+    pub(crate) fn replace_outbound(&mut self, endpoint: String, headers: Vec<(String, String)>) {
+        self.endpoint = endpoint;
+        self.headers = headers;
+    }
+
+    pub(crate) fn set_peer_route(&mut self, path: Option<&str>) {
+        self.headers
+            .retain(|(name, _)| !name.eq_ignore_ascii_case(gateway_protocol::peer::ROUTE_HEADER));
+        if let Some(path) = path {
+            self.headers.push((
+                gateway_protocol::peer::ROUTE_HEADER.to_owned(),
+                path.to_owned(),
+            ));
+        }
+    }
+
     /// 构造待打开的 WebSocket 连接描述
     pub fn new(endpoint: impl Into<String>, headers: Vec<(String, String)>) -> Self {
         Self {

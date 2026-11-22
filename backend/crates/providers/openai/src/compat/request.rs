@@ -1,35 +1,130 @@
 //! 下游客户端模型请求正文的 Codex 协议兼容
 
+use std::collections::HashSet;
+
 use serde_json::{Map, Value, json};
 
 /// 非官方客户端及跨客户端历史回填的兼容入口；调用方必须已选定 Codex/OAuth 上游
 /// 只处理已验证被拒绝的字段，不根据客户端品牌推断整份历史是否合法
 pub(super) fn normalize_non_codex_request_body(body: &mut Map<String, Value>) {
+    normalize_codex_oauth_options(body);
     let Some(input) = body.get_mut("input").and_then(Value::as_array_mut) else {
         return;
     };
+    let mut messages = Vec::new();
+    let mut referenced_ids = HashSet::new();
     for item in input {
         let Some(item) = item.as_object_mut() else {
             continue;
         };
-        if item.get("type").and_then(Value::as_str) != Some("reasoning") {
-            continue;
+        let kind = item.get("type").and_then(Value::as_str);
+        match kind {
+            Some("reasoning") => normalize_replayed_reasoning(item),
+            Some("message") => {
+                if generic_item_id(item).is_some() && has_inline_text_content(item) {
+                    messages.push(item);
+                }
+            }
+            _ => {
+                let is_reference = kind == Some("item_reference")
+                    || (item.get("type").is_none_or(Value::is_null)
+                        && !item.contains_key("role")
+                        && !item.contains_key("content"));
+                if is_reference && let Some(id) = generic_item_id(item) {
+                    referenced_ids.insert(id);
+                }
+            }
         }
-        // SDK 输出项的 status 不属于 Codex reasoning 输入合同；其他项的 status 可能合法
-        item.shift_remove("status");
-        // Codex 只接受空 content 数组；仅在加密历史仍可回填时去掉冗余明文，
-        // 没有加密内容的历史不自动丢弃，保留给上游明确拒绝
-        if item
-            .get("encrypted_content")
-            .and_then(Value::as_str)
-            .is_some_and(|content| !content.trim().is_empty())
-            && item
-                .get("content")
-                .and_then(Value::as_array)
-                .is_some_and(|content| !content.is_empty())
-        {
-            item.shift_remove("content");
+    }
+    // Codex 要求消息 ID 以 msg 开头；引用可以出现在消息前后，收齐后才能省略可选 ID
+    for message in messages {
+        if generic_item_id(message).is_some_and(|id| !referenced_ids.contains(id)) {
+            message.shift_remove("id");
         }
+    }
+}
+
+fn generic_item_id(item: &Map<String, Value>) -> Option<&str> {
+    item.get("id")
+        .and_then(Value::as_str)
+        .filter(|id| id.starts_with("item_"))
+}
+
+fn has_inline_text_content(item: &Map<String, Value>) -> bool {
+    matches!(
+        item.get("role").and_then(Value::as_str),
+        Some("user" | "assistant" | "developer" | "system")
+    ) && !item.contains_key("encrypted_content")
+        && match item.get("content") {
+            Some(Value::String(text)) => !text.is_empty(),
+            Some(Value::Array(parts)) => {
+                !parts.is_empty()
+                    && parts.iter().all(|part| {
+                        matches!(
+                            part.get("type").and_then(Value::as_str),
+                            Some("input_text" | "output_text")
+                        ) && part.get("text").is_some_and(Value::is_string)
+                    })
+            }
+            _ => false,
+        }
+}
+
+fn normalize_replayed_reasoning(item: &mut Map<String, Value>) {
+    // SDK 输出项的 status 不属于 Codex reasoning 输入合同；其他项的 status 可能合法
+    item.shift_remove("status");
+    // Codex 只接受空 content 数组；仅在加密历史仍可回填时去掉冗余明文，
+    // 没有加密内容的历史不自动丢弃，保留给上游明确拒绝
+    if item
+        .get("encrypted_content")
+        .and_then(Value::as_str)
+        .is_some_and(|content| !content.trim().is_empty())
+        && item
+            .get("content")
+            .and_then(Value::as_array)
+            .is_some_and(|content| !content.is_empty())
+    {
+        item.shift_remove("content");
+    }
+}
+
+fn normalize_codex_oauth_options(body: &mut Map<String, Value>) {
+    // Codex OAuth 拒绝这些客户端选项，即使采样参数取默认值
+    for field in [
+        "top_p",
+        "frequency_penalty",
+        "presence_penalty",
+        "chat_template_kwargs",
+        "user",
+        "metadata",
+        "safety_identifier",
+    ] {
+        body.shift_remove(field);
+    }
+    // Responses 自带用量；保留官方流式推理摘要等其他选项
+    if let Some(options) = body
+        .get_mut("stream_options")
+        .and_then(Value::as_object_mut)
+    {
+        options.shift_remove("include_usage");
+    }
+    // 只省略没有实际效果的配置，不静默取消客户端要求的截断、停止条件或缓存策略
+    if body.get("truncation").and_then(Value::as_str) == Some("disabled") {
+        body.shift_remove("truncation");
+    }
+    if body
+        .get("stop_sequences")
+        .and_then(Value::as_array)
+        .is_some_and(Vec::is_empty)
+    {
+        body.shift_remove("stop_sequences");
+    }
+    if body
+        .get("prompt_cache_options")
+        .and_then(Value::as_object)
+        .is_some_and(Map::is_empty)
+    {
+        body.shift_remove("prompt_cache_options");
     }
 }
 
@@ -71,8 +166,15 @@ pub(crate) fn normalize_codex_request_body(body: &mut Map<String, Value>) {
         }
     }
 
-    // Codex 拒绝显式采样温度和缓存保留时长，独立的缓存键仍须保留
-    for field in ["temperature", "prompt_cache_retention"] {
-        body.remove(field);
+    // Responses 上游统一忽略客户端输出上限，避免请求因上限低于模型下限被拒
+    // Codex 也不接受显式采样温度和缓存保留时长
+    for field in [
+        "max_output_tokens",
+        "max_completion_tokens",
+        "max_tokens",
+        "temperature",
+        "prompt_cache_retention",
+    ] {
+        body.shift_remove(field);
     }
 }

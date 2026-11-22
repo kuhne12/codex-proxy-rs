@@ -8,7 +8,7 @@ use axum::http::{HeaderMap, HeaderValue};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use bytes::Bytes;
 use gateway_api::openai::responses::{
-    ContinuationIntent, DecodedResponsesRequest, OpenAiRequestHeaders, OpenAiResponsesEncoder,
+    ContinuationIntent, DecodedGenerationRequest, OpenAiRequestHeaders, OpenAiResponsesEncoder,
     RequestDecodeError, ResponseCreateFrameError, ResponseEncodeError, decode_request_with_headers,
     decode_response_create_with_context,
 };
@@ -20,18 +20,227 @@ use gateway_core::{
 use gateway_protocol::openai::sse::parse_sse_events;
 use serde_json::{Value, json};
 
-fn decode_request(body: &[u8]) -> Result<DecodedResponsesRequest, RequestDecodeError> {
+fn decode_request(body: &[u8]) -> Result<DecodedGenerationRequest, RequestDecodeError> {
     decode_request_with_headers(body, &HeaderMap::new(), 64 * 1024 * 1024)
 }
 
 fn decode_response_create(
     payload: &str,
-) -> Result<DecodedResponsesRequest, ResponseCreateFrameError> {
+) -> Result<DecodedGenerationRequest, ResponseCreateFrameError> {
     decode_response_create_with_context(payload, &OpenAiRequestHeaders::default())
 }
 
-fn generate_request(body: Value) -> DecodedResponsesRequest {
+fn generate_request(body: Value) -> DecodedGenerationRequest {
     decode_request(body.to_string().as_bytes()).expect("test request should decode")
+}
+
+#[test]
+fn guardian_roles_should_use_complete_current_request_identity_before_header_projection() {
+    use gateway_protocol::openai::{CodexGuardianRole::*, codex_guardian_role};
+
+    let review = r#"{"thread_source":"guardian_review"}"#;
+    let classification =
+        r#"{"thread_source":"guardian_classifier","turn_trigger":"guardian_classifier"}"#;
+    let housekeeping = r#"{"turn_trigger":"guardian_housekeeper"}"#;
+    for (websocket, body_agent, body_turn, header_agent, header_turn, explicit, expected) in [
+        (
+            false,
+            Some("guardian"),
+            Some(review),
+            None,
+            None,
+            None,
+            Some(Reviewer),
+        ),
+        (
+            false,
+            None,
+            None,
+            Some("guardian"),
+            Some(review),
+            None,
+            Some(Reviewer),
+        ),
+        (
+            false,
+            None,
+            Some(review),
+            Some("guardian"),
+            None,
+            None,
+            None,
+        ),
+        (
+            false,
+            Some("other"),
+            Some(review),
+            Some("guardian"),
+            Some(review),
+            None,
+            None,
+        ),
+        (
+            false,
+            Some("guardian"),
+            Some(classification),
+            Some("guardian"),
+            Some(review),
+            None,
+            None,
+        ),
+        (
+            false,
+            Some("guardian"),
+            Some("invalid"),
+            Some("guardian"),
+            Some(review),
+            None,
+            None,
+        ),
+        (
+            false,
+            Some("guardian"),
+            Some(review),
+            None,
+            None,
+            Some("classifier"),
+            None,
+        ),
+        (false, None, None, None, None, Some("reviewer"), None),
+        (
+            false,
+            Some("guardian"),
+            Some(classification),
+            None,
+            None,
+            None,
+            Some(Classifier),
+        ),
+        (
+            false,
+            Some("guardian"),
+            Some(housekeeping),
+            None,
+            None,
+            None,
+            Some(Housekeeper),
+        ),
+        (
+            true,
+            None,
+            None,
+            Some("guardian"),
+            Some(review),
+            Some("reviewer"),
+            None,
+        ),
+        (
+            true,
+            None,
+            Some(review),
+            Some("guardian"),
+            Some(review),
+            None,
+            None,
+        ),
+        (
+            true,
+            Some("guardian"),
+            Some(classification),
+            Some("stale_agent"),
+            Some(review),
+            Some("reviewer"),
+            Some(Classifier),
+        ),
+        (
+            true,
+            Some("guardian"),
+            Some(review),
+            None,
+            None,
+            None,
+            Some(Reviewer),
+        ),
+    ] {
+        let mut body =
+            json!({"model":"gpt-5.6-luna","input":[],"generate":false,"client_metadata":{}});
+        if let Some(agent) = body_agent {
+            body["client_metadata"]["x-openai-subagent"] = json!(agent);
+        }
+        if let Some(turn) = body_turn {
+            body["client_metadata"]["x-codex-turn-metadata"] = json!(turn);
+        }
+        let mut headers = HeaderMap::new();
+        for (name, value) in [
+            ("x-openai-subagent", header_agent),
+            ("x-codex-turn-metadata", header_turn),
+            ("x-codex-guardian", explicit),
+        ] {
+            if let Some(value) = value {
+                headers.insert(name, HeaderValue::from_str(value).unwrap());
+            }
+        }
+        let decoded = if websocket {
+            body["type"] = json!("response.create");
+            decode_response_create_with_context(
+                &body.to_string(),
+                &OpenAiRequestHeaders::from_headers(&headers),
+            )
+            .unwrap()
+        } else {
+            decode_request_with_headers(body.to_string().as_bytes(), &headers, 64 * 1024).unwrap()
+        };
+        let payload = generate_operation(&decoded).protocol_payload();
+        if !websocket && matches!(expected, Some(Classifier | Housekeeper)) {
+            assert!(!payload.context().contains_key("use_websocket"));
+            assert!(
+                !payload
+                    .context()
+                    .contains_key(gateway_protocol::openai::WEBSOCKET_FRAME_CONTEXT_KEY)
+            );
+        }
+        if websocket && header_agent == Some("stale_agent") {
+            assert_eq!(
+                payload.body()["client_metadata"]["x-openai-subagent"],
+                "guardian"
+            );
+            let opaque = payload.context()["opaque_request_headers"]
+                .as_array()
+                .unwrap();
+            assert!(!opaque.iter().any(|pair| matches!(
+                pair[0].as_str(),
+                Some("x-codex-guardian" | "x-openai-subagent")
+            )));
+        }
+        assert_eq!(
+            codex_guardian_role(payload.body(), payload.context()),
+            expected,
+            "body={body}, headers={headers:?}"
+        );
+    }
+    let mut repeated = HeaderMap::new();
+    repeated.append("x-openai-subagent", HeaderValue::from_static("guardian"));
+    repeated.append("x-openai-subagent", HeaderValue::from_static("other"));
+    repeated.insert("x-codex-turn-metadata", HeaderValue::from_static(review));
+    let decoded = decode_request_with_headers(
+        br#"{"model":"gpt-5.6-luna","input":[]}"#,
+        &repeated,
+        64 * 1024,
+    )
+    .unwrap();
+    let payload = generate_operation(&decoded).protocol_payload();
+    assert_eq!(codex_guardian_role(payload.body(), payload.context()), None);
+    for malformed in [
+        r#"{"thread_source":"guardian_classifier","thread_source":"guardian_review"}"#,
+        r#"{"thread_source":null}"#,
+        r#"["guardian_review"]"#,
+    ] {
+        let mut body = json!({"model":"gpt-5.6-luna","input":[],"client_metadata":{"x-openai-subagent":"guardian"}});
+        body["client_metadata"]["x-codex-turn-metadata"] = json!(malformed);
+        let decoded = generate_request(body);
+        let payload = generate_operation(&decoded).protocol_payload();
+        assert_eq!(codex_guardian_role(payload.body(), payload.context()), None);
+    }
 }
 
 #[test]
@@ -78,7 +287,7 @@ fn decoder_should_attach_only_identified_codex_inference_turns() {
 }
 
 fn generate_operation(
-    decoded: &DecodedResponsesRequest,
+    decoded: &DecodedGenerationRequest,
 ) -> &gateway_core::operation::GenerateRequest {
     let Operation::Generate(request) = decoded.operation() else {
         panic!("Responses decoder must produce Generate")
@@ -86,11 +295,11 @@ fn generate_operation(
     request
 }
 
-fn openai_wire_body(decoded: &DecodedResponsesRequest) -> &serde_json::Map<String, Value> {
+fn openai_wire_body(decoded: &DecodedGenerationRequest) -> &serde_json::Map<String, Value> {
     generate_operation(decoded).protocol_payload().body()
 }
 
-fn openai_protocol_context(decoded: &DecodedResponsesRequest) -> &serde_json::Map<String, Value> {
+fn openai_protocol_context(decoded: &DecodedGenerationRequest) -> &serde_json::Map<String, Value> {
     generate_operation(decoded).protocol_payload().context()
 }
 
@@ -492,7 +701,7 @@ fn decoder_should_strip_http_transport_but_leave_source_headers_for_provider() {
         HeaderValue::from_static(r#"{"scheme":"https"}"#),
     );
     headers.insert("accept-encoding", HeaderValue::from_static("br, gzip"));
-    // 正文未压缩；入口现在消费 Content-Encoding，但仍不得向上游透传
+    // identity 与未压缩的正文匹配，Content-Encoding 由入口消费
     headers.insert("content-encoding", HeaderValue::from_static("identity"));
     headers.insert("x-openai-future-mode", HeaderValue::from_static("keep"));
 
@@ -1004,7 +1213,8 @@ fn capacity_failure_projection_preserves_wire_metadata_and_original_events() {
             ("response.failed", false),
         ] {
             for status in [None, Some(400), Some(429), Some(503)] {
-                let error = json!({"code": code, "type": "service_unavailable_error", "message": "busy", "future": 42});
+                let error = json!({"code": code, "type": "service_unavailable_error", "message": "busy", "future": 42,
+                    "headers":{"retry-after":"309", "Retry-After-Ms":"309000", "x-request-id":"req_capacity"}});
                 let mut original = if event_type == "error" {
                     json!({"type": event_type, "error": error, "sequence_number": 3})
                 } else {
@@ -1046,11 +1256,16 @@ fn capacity_failure_projection_preserves_wire_metadata_and_original_events() {
                 assert_eq!(sse_data["response"]["error"]["code"], "server_error");
                 assert_eq!(sse_data["response"]["error"]["message"], "busy");
                 assert_eq!(sse_data["response"]["error"]["future"], 42);
+                assert_eq!(
+                    sse_data["response"]["error"]["headers"],
+                    json!({"x-request-id":"req_capacity"})
+                );
                 let messages = ws.push_websocket(&event);
                 let ws_data: Value = serde_json::from_str(&messages[0]).expect("JSON");
                 if event_type == "error" && status.is_some() {
                     let mut expected = original.clone();
                     expected["error"]["code"] = json!("server_error");
+                    expected["error"]["headers"] = json!({"x-request-id":"req_capacity"});
                     expected["status_code"] = json!(503);
                     assert_eq!(ws_data, expected);
                 } else {

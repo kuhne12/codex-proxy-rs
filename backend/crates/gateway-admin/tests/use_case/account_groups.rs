@@ -350,6 +350,8 @@ fn group_record() -> AccountGroupRecord {
     AccountGroupRecord {
         plugin_owned: false,
         allow_image_generation: true,
+        allow_subagents: true,
+        model_access: Default::default(),
         fast_mode: FastMode::Default,
         id: group_id(),
         name: "Primary".to_owned(),
@@ -383,6 +385,7 @@ fn member(account_id: &str, total_slots: u64) -> AccountGroupMemberFact {
         group_id: group_id(),
         account_id: account_id.to_owned(),
         status: AccountStatusFacts {
+            quota_paused: false,
             enabled: true,
             credential_state: CredentialState::Ready,
             access_token_expires_at: None,
@@ -425,6 +428,8 @@ async fn invalid_group_fields_are_rejected_before_store_mutations() {
             &context,
             CreateAccountGroup {
                 allow_image_generation: true,
+                allow_subagents: true,
+                model_access: Default::default(),
                 fast_mode: FastMode::Default,
                 name: " invalid".to_owned(),
                 description: None,
@@ -439,6 +444,8 @@ async fn invalid_group_fields_are_rejected_before_store_mutations() {
             &context,
             UpdateAccountGroup {
                 allow_image_generation: None,
+                allow_subagents: None,
+                model_access: None,
                 fast_mode: None,
                 id: record.id,
                 name: "valid".to_owned(),

@@ -22,6 +22,96 @@ use tower::ServiceExt;
 
 use super::{api_router, authenticated_client, authenticated_client_with_min_versions};
 
+#[tokio::test]
+async fn anthropic_models_use_explicit_headers_and_cursor_pagination() {
+    let router = api_router(ModelsExecution::new()).await;
+    for (path, id, more) in [
+        ("/v1/models?limit=1", "model-a", true),
+        ("/v1/models?limit=1&after_id=model-a", "model-b", false),
+        ("/v1/models?limit=1&before_id=model-b", "model-a", false),
+    ] {
+        let response = router
+            .clone()
+            .oneshot(
+                Request::get(path)
+                    .header("x-api-key", "sk_models_test")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["data"].as_array().unwrap().len(), 1);
+        assert_eq!(body["data"][0]["type"], "model");
+        assert_eq!(body["first_id"], id);
+        assert_eq!(body["last_id"], id);
+        assert_eq!(body["has_more"], more);
+        assert!(body.get("object").is_none());
+    }
+    for path in [
+        "/v1/models?limit=0",
+        "/v1/models?limit=1001",
+        "/v1/models?limit=invalid",
+        "/v1/models?after_id=unknown",
+    ] {
+        let response = router
+            .clone()
+            .oneshot(
+                Request::get(path)
+                    .header("authorization", "Bearer sk_models_test")
+                    .header("anthropic-version", "2023-06-01")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["type"], "error");
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+    }
+}
+
+#[tokio::test]
+async fn anthropic_model_detail_keeps_public_model_access() {
+    let router = api_router(ModelsExecution::new()).await;
+    for (path, expected) in [
+        ("/v1/models/model-a", StatusCode::OK),
+        ("/v1/models/unknown", StatusCode::NOT_FOUND),
+    ] {
+        let response = router
+            .clone()
+            .oneshot(
+                Request::get(path)
+                    .header("x-api-key", "sk_models_test")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        if expected == StatusCode::NOT_FOUND {
+            assert_eq!(body["error"]["type"], "not_found_error");
+        }
+        assert_eq!(
+            body["type"],
+            if expected == StatusCode::OK {
+                "model"
+            } else {
+                "error"
+            }
+        );
+    }
+}
+
 pub(super) struct ModelsExecution {
     client: AuthenticatedClient,
     presentation: Option<ModelPresentation>,
@@ -132,6 +222,7 @@ impl ExecutionService for ModelsExecution {
         _client: &'a AuthenticatedClient,
         protocol: &'a str,
         version: &'a str,
+        _peer_route: Option<&'a axum::http::HeaderValue>,
     ) -> BoxFuture<'a, Result<Vec<PublicModelDescriptor>, ProviderCatalogUnavailable>> {
         Box::pin(async move {
             assert_eq!(protocol, "codex");
@@ -208,7 +299,9 @@ async fn request_settings_reach_query_terminal_without_mutating_authenticated_ba
             settings: Some(|settings| {
                 let mut runtime = serde_json::to_value(&settings.runtime).unwrap();
                 runtime["model_mappings"] = serde_json::json!({"model-a":"plugin-model"});
-                runtime["concurrency_wait_timeout_seconds"] = serde_json::json!(30);
+                runtime["key_queue_timeout_seconds"] = serde_json::json!(30);
+                runtime["account_queue_timeout_seconds"] = serde_json::json!(30);
+                runtime["switch_account_on_queue_failure"] = serde_json::json!(false);
                 settings.runtime = serde_json::from_value(runtime).unwrap();
                 settings.fast_mode = FastMode::Disabled;
             }),
@@ -313,13 +406,13 @@ async fn model_query_middleware_short_circuit_sets_json_content_type_without_cal
 }
 
 #[tokio::test]
-async fn native_catalog_preserves_complete_objects_and_only_rewrites_alias_slug() {
+async fn native_catalog_preserves_upstream_fields_except_alias_and_group_subagent_policy() {
     let original = serde_json::json!({
         "slug": "gpt-native", "display_name": "Official name", "priority": 47,
         "base_instructions": "Official instructions\nDo not replace.",
         "model_messages": {"token_budget": "upstream template", "future_section": [null, {"a": true}]},
         "service_tiers": [{"id": "priority", "name": "Fast", "description": "Official speed tier"}],
-        "tool_mode": "code_mode_only", "use_responses_lite": true,
+        "tool_mode": "code_mode_only", "use_responses_lite": true, "multi_agent_version": "v2",
         "supports_reasoning_summary_parameter": true, "default_reasoning_summary": "detailed",
         "future_field": {"nested": [1, null, "value"]}, "explicit_null": null
     });
@@ -331,35 +424,49 @@ async fn native_catalog_preserves_complete_objects_and_only_rewrites_alias_slug(
         )
         .expect("payload"),
     };
-    let execution = Arc::new(ModelsExecution {
-        client: authenticated_client("sk_models_test"),
-        presentation: None,
-        native: Some(Ok(vec![entry("gpt-native"), entry("my-alias")])),
-        requested_versions: Mutex::default(),
-        middleware: None,
-    });
-    let response = api_router(execution.clone())
-        .await
-        .oneshot(authorized_request(
-            "/v1/models?client_version=0.154.0-alpha.3",
-        ))
-        .await
-        .expect("response");
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(response.headers()["cache-control"], "private, no-store");
-    assert!(response.headers().get("etag").is_none());
-    let body = to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("body");
-    let value: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
-    assert_eq!(value["models"][0], original);
-    let mut alias = original;
-    alias["slug"] = serde_json::json!("my-alias");
-    assert_eq!(value["models"][1], alias);
-    assert_eq!(
-        *execution.requested_versions.lock().expect("versions"),
-        ["0.154.0-alpha.3"]
-    );
+    for (allowed, client) in [
+        (true, authenticated_client("sk_models_test")),
+        (
+            false,
+            super::group_permissions::execution()
+                .authenticate("sk_group_permissions")
+                .unwrap(),
+        ),
+    ] {
+        let execution = Arc::new(ModelsExecution {
+            client,
+            presentation: None,
+            native: Some(Ok(vec![entry("gpt-native"), entry("my-alias")])),
+            requested_versions: Mutex::default(),
+            middleware: None,
+        });
+        let response = api_router(execution.clone())
+            .await
+            .oneshot(authorized_request(
+                "/v1/models?client_version=0.154.0-alpha.3",
+            ))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["cache-control"], "private, no-store");
+        assert!(response.headers().get("etag").is_none());
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+        let mut expected = original.clone();
+        if !allowed {
+            expected["multi_agent_version"] = serde_json::json!("disabled");
+        }
+        assert_eq!(value["models"][0], expected);
+        let mut alias = expected;
+        alias["slug"] = serde_json::json!("my-alias");
+        assert_eq!(value["models"][1], alias);
+        assert_eq!(
+            *execution.requested_versions.lock().expect("versions"),
+            ["0.154.0-alpha.3"]
+        );
+    }
 }
 
 #[tokio::test]

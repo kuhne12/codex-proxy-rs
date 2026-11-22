@@ -21,7 +21,7 @@ use crate::{
     concurrency::{CapacityWait, ConcurrencyWaitBudget, ConcurrencyWaitQueue},
     engine::{
         AttemptCoordinator, EngineError, ExecutionStore, GatewayEngine, ModelRequestId,
-        NewModelRequest, ProbeFailure, ProviderAccountId, UpstreamSendState,
+        ModelRouteScope, NewModelRequest, ProbeFailure, ProviderAccountId, UpstreamSendState,
         admission::{
             ClientAdmissionDecision, ClientAdmissionPort, ClientAdmissionRejection,
             ClientAdmissionRequest,
@@ -62,7 +62,7 @@ use crate::{
     policy::{ClientApiKeyId, ClientPolicy},
     provider_ports::{ProviderSessionAffinityPort, ProviderStoreErrorKind},
     routing::{
-        FrozenAccountScope, ProviderCatalogUnavailable, ProviderModelContent,
+        DirectAccountModel, FrozenAccountScope, ProviderCatalogUnavailable, ProviderModelContent,
         PublicModelDescriptor, PublicModelId, RoutingContext, RuntimeSnapshot, UpstreamModelId,
         request_settings::RequestSettings,
     },
@@ -478,9 +478,10 @@ impl DefaultExecutionService {
         let budget_key_id = request.client.policy.key_id().clone();
         let mut entered_execution = false;
         let result = async {
-            crate::engine::image_generation::check_image_generation(
-                authorization.account_scope.allows_image_generation(),
+            crate::engine::group_permissions::check_group_permissions(
+                &authorization.account_scope,
                 &request.operation,
+                &[],
             )?;
             if authorization.cancellation.is_cancelled() {
                 return Err(GatewayError::new(
@@ -507,6 +508,48 @@ impl DefaultExecutionService {
                 }
                 routing_context.required_provider = Some(provider);
             }
+            let continuation = match request.metadata.previous_response_id.as_ref() {
+                Some(previous) => {
+                    let resolve = self
+                        .continuation
+                        .resolve(request.client.policy.key_id(), previous)
+                        .fuse();
+                    let timeout = Delay::new(COORDINATION_TIMEOUT).fuse();
+                    pin_mut!(resolve, timeout);
+                    let pin = select_biased! {
+                        result = resolve => match result {
+                            Ok(pin) => pin,
+                            Err(error)
+                                if error.kind() == NativeContinuationStoreErrorKind::Unavailable =>
+                            {
+                                tracing::debug!(request_id = request_id.as_str(), %error, "Continuation affinity 查询失败，退化为外部续接");
+                                None
+                            }
+                            Err(error)
+                                if error.kind() == NativeContinuationStoreErrorKind::OwnershipMismatch =>
+                            {
+                                return Err(GatewayError::new(GatewayErrorKind::PolicyDenied, "Continuation does not belong to this client API key."));
+                            }
+                            Err(error) => {
+                                tracing::warn!(request_id = request_id.as_str(), %error, "Continuation affinity 记录无效，已拒绝续接");
+                                return Err(GatewayError::new(GatewayErrorKind::Internal, "Continuation state is invalid."));
+                            }
+                        },
+                        _ = timeout => None,
+                    };
+                    Some(match pin {
+                        Some(pin) if !pin.matches_client(request.client.policy.key_id()) => {
+                            return Err(GatewayError::new(GatewayErrorKind::PolicyDenied, "Continuation does not belong to this client API key."));
+                        }
+                        Some(pin) if !authorization.account_scope.allows(pin.account()) => {
+                            return Err(GatewayError::new(GatewayErrorKind::PolicyDenied, "Continuation account is outside the client account scope."));
+                        }
+                        Some(pin) => ContinuationBinding::Pinned(pin),
+                        None => ContinuationBinding::External(previous.clone()),
+                    })
+                }
+                None => None,
+            };
             let account_scope = Arc::clone(&authorization.account_scope);
             let plan = match &request.target {
                 ExecutionTarget::ProviderEndpoint {
@@ -573,65 +616,66 @@ impl DefaultExecutionService {
                             }
                         }
                     }
-                    request.client.snapshot.plan(
-                        &target_model,
-                        &request.operation,
-                        account_scope,
-                        &target_context,
-                    )
+                    let pin = continuation.as_ref().and_then(ContinuationBinding::pinned);
+                    let extension_route = ModelRouteScope {
+                        client_api_key: request.client.policy.key_id(),
+                        account_groups: &account_group_ids,
+                        extensions: &authorization.extension_scope,
+                        model: public_model.as_str(),
+                    };
+                    let direct = request.client.snapshot
+                        .available_provider_kinds(&account_scope, &target_context)
+                        .find_map(|kind| {
+                            let provider = self.providers.get(kind)?;
+                            let previous = pin.filter(|pin| pin.provider() == kind)
+                                .and_then(NativeContinuationPin::session_state);
+                            let model = provider.direct_account_model(
+                                &target_model,
+                                &request.operation,
+                                previous,
+                                request.client.snapshot.settings(),
+                            )?;
+                            middleware.as_ref()
+                                .is_none_or(|plan| plan.preserves_model_bindings(extension_route, kind, &model))
+                                .then(|| (kind.clone(), model))
+                        });
+                    if let Some((kind, model)) = direct {
+                        let account_scope = match authorization.required_account.as_ref() {
+                            Some(id) => Arc::new(account_scope.restricted_to(&Default::default(), &[id.clone()].into())),
+                            None => account_scope,
+                        };
+                        request.client.snapshot.plan_with_direct_account_model(
+                            &target_model,
+                            &request.operation,
+                            account_scope,
+                            &target_context,
+                            DirectAccountModel {
+                                provider: &kind,
+                                model: &model,
+                                continuation_owner: pin.map(NativeContinuationPin::account),
+                            },
+                            |account| upstream_adapters.as_ref().is_none_or(|plan| {
+                                plan.uses_native_upstream(extension_route, &kind, account)
+                            }),
+                        )
+                    } else {
+                        request.client.snapshot.plan(
+                            &target_model,
+                            &request.operation,
+                            account_scope,
+                            &target_context,
+                        )
+                    }
                 }
             }
             .map_err(map_routing_error)?;
-            let continuation = match request.metadata.previous_response_id.as_ref() {
-                Some(previous) => {
-                    let resolve = self
-                        .continuation
-                        .resolve(request.client.policy.key_id(), previous)
-                        .fuse();
-                    let timeout = Delay::new(COORDINATION_TIMEOUT).fuse();
-                    pin_mut!(resolve, timeout);
-                    let pin = select_biased! {
-                        result = resolve => match result {
-                            Ok(pin) => pin,
-                            Err(error)
-                                if error.kind() == NativeContinuationStoreErrorKind::Unavailable =>
-                            {
-                                tracing::debug!(request_id = request_id.as_str(), %error, "Continuation affinity 查询失败，退化为外部续接");
-                                None
-                            }
-                            Err(error)
-                                if error.kind() == NativeContinuationStoreErrorKind::OwnershipMismatch =>
-                            {
-                                return Err(GatewayError::new(GatewayErrorKind::PolicyDenied, "Continuation does not belong to this client API key."));
-                            }
-                            Err(error) => {
-                                tracing::warn!(request_id = request_id.as_str(), %error, "Continuation affinity 记录无效，已拒绝续接");
-                                return Err(GatewayError::new(GatewayErrorKind::Internal, "Continuation state is invalid."));
-                            }
-                        },
-                        _ = timeout => None,
-                    };
-                    Some(match pin {
-                        Some(pin) if !pin.matches_client(request.client.policy.key_id()) => {
-                            return Err(GatewayError::new(GatewayErrorKind::PolicyDenied, "Continuation does not belong to this client API key."));
-                        }
-                        Some(pin) if !authorization.account_scope.allows(pin.account()) => {
-                            return Err(GatewayError::new(GatewayErrorKind::PolicyDenied, "Continuation account is outside the client account scope."));
-                        }
-                        Some(pin)
-                            if !plan.candidates().iter().any(|candidate| candidate.provider() == pin.provider()) =>
-                        {
-                            return Err(GatewayError::new(GatewayErrorKind::NoAvailableProvider, "Continuation provider is not available."));
-                        }
-                        Some(pin) => {
-                            attach_continuation_session_state(&mut request.operation, &pin);
-                            ContinuationBinding::Pinned(pin)
-                        }
-                        None => ContinuationBinding::External(previous.clone()),
-                    })
+            if let Some(pin) = continuation.as_ref().and_then(ContinuationBinding::pinned) {
+                if !plan.candidates().iter().any(|candidate| candidate.provider() == pin.provider()
+                    && candidate.account_scope().allows(pin.account())) {
+                    return Err(GatewayError::new(GatewayErrorKind::NoAvailableProvider, "Continuation provider is not available."));
                 }
-                None => None,
-            };
+                attach_continuation_session_state(&mut request.operation, pin);
+            }
             if start_guard.is_none() {
                 start_guard = Some(
                     self.prepare_execution_start(&request, &request_id, &mut authorization)
@@ -724,7 +768,6 @@ impl DefaultExecutionService {
         request_id: &ModelRequestId,
         authorization: &mut AuthorizedExecution,
     ) -> Result<ExecutionStartGuard, GatewayError> {
-        let concurrency_wait_budget = ConcurrencyWaitBudget::default();
         let (admission, admission_decision_ms) = if authorization.nested.is_some() {
             let permit = authorization.nested_permit.take().ok_or_else(|| {
                 GatewayError::new(
@@ -741,7 +784,6 @@ impl DefaultExecutionService {
                     request_id,
                     authorization.deadline_at,
                     authorization.cancellation.clone(),
-                    &concurrency_wait_budget,
                 )
                 .await?;
             let admission = if let Some(permit) = authorization.nested_permit.take() {
@@ -774,7 +816,6 @@ impl DefaultExecutionService {
         Ok(ExecutionStartGuard {
             admission,
             active_request,
-            concurrency_wait_budget,
             admission_decision_ms,
         })
     }
@@ -802,19 +843,40 @@ impl DefaultExecutionService {
         let ExecutionStartGuard {
             admission,
             active_request,
-            concurrency_wait_budget,
             admission_decision_ms,
         } = start_guard;
-        let observation = plan
-            .candidates()
-            .first()
-            .map_or_else(Default::default, |candidate| {
-                providers.request_observation(
-                    candidate.provider(),
-                    &operation,
-                    client.policy.key_id(),
-                )
+        let observation_provider = match &target {
+            ExecutionTarget::ProviderEndpoint { provider, .. } => Some(provider),
+            ExecutionTarget::Model(_) => plan
+                .candidates()
+                .iter()
+                .find(|candidate| {
+                    operation
+                        .provider_session_state(candidate.provider().as_str())
+                        .is_some_and(|state| state.extension_owner().is_none())
+                })
+                .or_else(|| plan.candidates().first())
+                .map(|candidate| candidate.provider()),
+        };
+        let provider_observation =
+            observation_provider.map_or_else(Default::default, |candidate| {
+                providers.request_observation(candidate, &operation, client.policy.key_id())
             });
+        // 纯协议事实不依赖候选顺序，Provider 仅补充所属会话的旧配置和恢复关联
+        let observation = match &operation {
+            Operation::Generate(request) => {
+                let payload = request.protocol_payload();
+                gateway_protocol::request::request_observation(
+                    payload.protocol(),
+                    payload.body(),
+                    payload.context(),
+                    provider_observation
+                        .previous_reasoning_effort_override
+                        .as_deref(),
+                )
+            }
+            _ => Default::default(),
+        };
         let (request_kind, subagent_kind) = if let Some(nested) = authorization.nested.as_ref() {
             (
                 Some("plugin_child_model".to_owned()),
@@ -847,7 +909,9 @@ impl DefaultExecutionService {
             operation: operation.kind(),
             endpoint: metadata.endpoint,
             client_transport: metadata.transport.as_str().to_owned(),
-            requested_model: target.into_public_model().or(observation.requested_model),
+            requested_model: target
+                .into_public_model()
+                .or(provider_observation.requested_model),
             client_ip: metadata.client_ip,
             user_agent: metadata.user_agent,
             reasoning_effort: observation.reasoning_effort,
@@ -855,7 +919,7 @@ impl DefaultExecutionService {
             request_kind,
             subagent_kind,
             compact: observation.compact,
-            continuation: observation.continuation,
+            continuation: provider_observation.continuation,
             image_generation_requested: operation.image_generation_requested(),
             admission_decision_ms,
             started_at,
@@ -884,7 +948,7 @@ impl DefaultExecutionService {
             )
             .await
         {
-            Ok(core) => core.with_concurrency_wait_budget(concurrency_wait_budget),
+            Ok(core) => core,
             Err(error) => {
                 if let Some(budget) = &self.budget {
                     settle_budget(
@@ -1245,13 +1309,13 @@ impl DefaultExecutionService {
         request_id: &ModelRequestId,
         deadline_at: Deadline,
         cancellation: CancellationToken,
-        budget: &ConcurrencyWaitBudget,
     ) -> Result<AdmissionLease, GatewayError> {
         let policy = client.snapshot.client_queue_policy();
         let limits = client.policy.limits();
         let key = client.policy.key_id();
+        let budget = ConcurrencyWaitBudget::default();
         let mut waiting =
-            CapacityWait::new(&self.admission_waiting, policy, deadline_at.at(), budget);
+            CapacityWait::new(&self.admission_waiting, policy, deadline_at.at(), &budget);
         let mut admission = AdmissionLease {
             port: Arc::clone(&self.admissions),
             diagnostics: self.diagnostics.clone(),
@@ -1467,7 +1531,18 @@ impl DefaultExecutionService {
             }
             _ => (AccountProbeErrorSource::Gateway, None, None),
         };
+        let mut failure = AccountProbeError::new(
+            gateway_error_from_engine(error),
+            source,
+            send_state,
+            upstream_response,
+        );
         if let EngineError::Provider(provider_error) = error {
+            if source == AccountProbeErrorSource::Provider {
+                failure.proxy_hint = provider_error
+                    .diagnostic()
+                    .and_then(|diagnostic| diagnostic.proxy_hint());
+            }
             let latency = started_at.elapsed().unwrap_or_default();
             let latency_ms = u64::try_from(latency.as_millis()).unwrap_or(u64::MAX);
             tracing::warn!(
@@ -1503,12 +1578,7 @@ impl DefaultExecutionService {
                 );
             }
         }
-        AccountProbeError::new(
-            gateway_error_from_engine(error),
-            source,
-            send_state,
-            upstream_response,
-        )
+        failure
     }
 }
 
@@ -1557,6 +1627,7 @@ impl ExecutionService for DefaultExecutionService {
         client: &'a AuthenticatedClient,
         protocol: &'a str,
         client_version: &'a str,
+        peer_route: Option<&'a http::HeaderValue>,
     ) -> BoxFuture<'a, Result<Vec<PublicModelDescriptor>, ProviderCatalogUnavailable>> {
         Box::pin(async move {
             let scope = client.policy.account_scope();
@@ -1566,7 +1637,13 @@ impl ExecutionService for DefaultExecutionService {
             for kind in scope.provider_kinds() {
                 let provider = providers.get(kind).ok_or(ProviderCatalogUnavailable)?;
                 let Some(models) = provider
-                    .query_client_model_catalog(scope, protocol, client_version)
+                    .query_client_model_catalog(
+                        client.policy.key_id(),
+                        scope,
+                        protocol,
+                        client_version,
+                        peer_route,
+                    )
                     .await?
                 else {
                     for profile in client.snapshot.profiles_for_provider_scope(kind, scope) {
@@ -1792,7 +1869,7 @@ impl NestedModelExecutionPort for DefaultExecutionService {
             let cancelled = cancellation.cancelled().fuse();
             let timeout = Delay::new(DIAGNOSTIC_TIMEOUT).fuse();
             let catalog = self
-                .client_model_catalog(&client, &protocol, &client_version)
+                .client_model_catalog(&client, &protocol, &client_version, None)
                 .fuse();
             pin_mut!(cancelled, timeout, catalog);
             let models = select_biased! {

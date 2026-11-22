@@ -35,6 +35,52 @@ struct TestClientKeyStore {
 
 #[async_trait]
 impl ClientKeyStore for TestClientKeyStore {
+    async fn budget_reference_accounts(
+        &self,
+        _: &gateway_core::policy::ClientApiKeyId,
+        _: &str,
+        _: &str,
+    ) -> gateway_admin::ports::store::AdminStoreResult<
+        gateway_admin::model::client_keys::BudgetReferenceAccountPage,
+    > {
+        Err(unused())
+    }
+
+    async fn batch_update_client_keys(
+        &self,
+        _: gateway_admin::model::client_keys::BatchUpdateClientKeys,
+        _: gateway_admin::ports::store::BatchClientKeyProfileMerger,
+        _: &MutationContext,
+    ) -> AdminStoreResult<Revision> {
+        Err(unused())
+    }
+
+    async fn client_key_budget_window(
+        &self,
+        _: &gateway_core::policy::ClientApiKeyId,
+        _: gateway_admin::model::client_keys::ClientKeyBudgetWindowPeriod,
+    ) -> gateway_admin::ports::store::AdminStoreResult<
+        gateway_admin::model::client_keys::ClientKeyBudgetWindow,
+    > {
+        Err(gateway_admin::ports::store::AdminStoreError::new(
+            gateway_admin::ports::store::AdminStoreErrorKind::Unavailable,
+            "client key",
+            "unused budget window",
+        ))
+    }
+    async fn set_client_key_budget_window(
+        &self,
+        _: gateway_admin::model::client_keys::SetClientKeyBudgetWindow,
+        _: gateway_admin::model::client_keys::ClientKeyBudgetMutationOrigin,
+        _: &MutationContext,
+    ) -> gateway_admin::ports::store::AdminStoreResult<u64> {
+        Err(gateway_admin::ports::store::AdminStoreError::new(
+            gateway_admin::ports::store::AdminStoreErrorKind::Unavailable,
+            "client key",
+            "unused budget window",
+        ))
+    }
+
     async fn update_client_key_budget_limits(
         &self,
         _: gateway_admin::model::client_keys::UpdateClientKeyBudgetLimits,
@@ -52,6 +98,15 @@ impl ClientKeyStore for TestClientKeyStore {
     ) -> AdminStoreResult<()> {
         self.resets.lock().unwrap().push(command);
         Ok(())
+    }
+
+    async fn client_key_budget(
+        &self,
+        id: &gateway_core::policy::ClientApiKeyId,
+    ) -> AdminStoreResult<Option<gateway_core::engine::budget::ClientBudgetStatus>> {
+        self.get_client_key(id)
+            .await
+            .map(|key| key.map(|row| row.budget))
     }
 
     async fn get_client_key(
@@ -143,6 +198,34 @@ impl ClientKeyStore for TestClientKeyStore {
         _: &MutationContext,
     ) -> AdminStoreResult<Revision> {
         Err(unused())
+    }
+}
+
+#[tokio::test]
+async fn batch_keys_require_a_change_and_unique_targets() {
+    use gateway_admin::model::client_keys::BatchUpdateClientKeys;
+    let services = super::AdminHarness::new()
+        .client_keys(Arc::new(TestClientKeyStore::default()))
+        .build()
+        .await;
+    let id = ClientApiKeyId::new("key_a").unwrap();
+    for patch in [
+        BatchUpdateClientKeys {
+            ids: vec![id.clone()],
+            ..Default::default()
+        },
+        BatchUpdateClientKeys {
+            ids: vec![id.clone(), id],
+            enabled: Some(false),
+            ..Default::default()
+        },
+    ] {
+        let error = services
+            .client_keys()
+            .batch_update(&mutation_context(), patch)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), AdminErrorKind::Invalid);
     }
 }
 

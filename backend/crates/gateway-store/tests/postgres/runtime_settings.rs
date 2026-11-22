@@ -22,6 +22,8 @@ pub(super) fn settings_with_margin(refresh_margin_seconds: u64) -> RuntimeSettin
             ("grok-latest".to_owned(), "grok-4.5".to_owned()),
         ]),
         values: gateway_admin::model::settings::RuntimeSettingsValues {
+            openai_oauth_guardian_review_model: true,
+            openai_request_country: Default::default(),
             codex_privacy_policy: Default::default(),
             request_location_enabled: false,
             request_location: Default::default(),
@@ -30,7 +32,9 @@ pub(super) fn settings_with_margin(refresh_margin_seconds: u64) -> RuntimeSettin
             max_concurrent_per_account: 3,
             max_waiting_per_key: 0,
             max_waiting_per_account: 0,
-            concurrency_wait_timeout_seconds: 30,
+            key_queue_timeout_seconds: 30,
+            account_queue_timeout_seconds: 30,
+            switch_account_on_queue_failure: false,
             max_retry_after_seconds: 240,
             openai_guardian_reserved_concurrency: 0,
             openai_account_affinity: gateway_core::account::AccountAffinity::Relaxed,
@@ -38,6 +42,7 @@ pub(super) fn settings_with_margin(refresh_margin_seconds: u64) -> RuntimeSettin
             openai_session_affinity_ttl_hours: 24,
             responses_max_decompressed_body_bytes: 64 * 1024 * 1024,
             smart_scheduling: gateway_core::account::SmartSchedulingConfig::default(),
+            quota_reset_window_weights: gateway_core::account::ResetWindowWeights::default(),
             min_codex_desktop_version: None,
             min_codex_cli_version: None,
             usage_retention_days: 31,
@@ -45,9 +50,10 @@ pub(super) fn settings_with_margin(refresh_margin_seconds: u64) -> RuntimeSettin
             audit_retention_days: 90,
             account_error_protection: enabled_protection(),
             account_warmup_enabled: false,
-            account_warmup_schedule_time: "08:00".to_owned(),
+            account_warmup_cron: "0 8 * * *".to_owned(),
             account_warmup_model: None,
             reset_credit_lead_minutes: 10,
+            reset_credit_on_low_weekly_quota: false,
             reset_credit_max_weekly_remaining_percent: None,
         },
     }
@@ -110,7 +116,7 @@ async fn privacy_policy_defaults_off_and_round_trips_in_snapshot() {
 }
 
 #[tokio::test]
-async fn smart_settings_round_trip_publish_and_restore_database_defaults() {
+async fn scheduling_settings_round_trip_publish_and_restore_database_defaults() {
     use gateway_core::account::SmartSchedulingConfig;
     use gateway_store::postgres::{PgRuntimeSnapshotRepository, RuntimeSnapshotRepository};
     let Some(database) = TestDatabase::create("smart_config").await else {
@@ -123,20 +129,29 @@ async fn smart_settings_round_trip_publish_and_restore_database_defaults() {
         SmartSchedulingConfig::default()
     );
     let mut update = settings_with_margin(3600);
-    update.values.smart_scheduling =
-        SmartSchedulingConfig::new([0.0, 2.0, 1.0, 0.5, 1.2, 2.3]).unwrap();
-    let expected = update.values.smart_scheduling;
+    let windows = gateway_core::account::ResetWindowWeights::new([0.0, 1.5, 0.0]).unwrap();
+    update.values.quota_reset_window_weights = windows;
+    let expected = serde_json::json!({
+        "loadWeight": 0.0, "quotaWeight": 2.0, "healthWeight": 1.0, "latencyWeight": 0.5, "resetWeight": 1.2, "queueWeight": 2.3,
+        "resetWindowWeights": {"fiveHour":2.0,"weekly":8.0,"monthly":0.0}
+    });
+    update.values.smart_scheduling = serde_json::from_value(expected.clone()).unwrap();
     repository.update_runtime_settings(update).await.unwrap();
     let reloaded = repository.load_runtime_settings().await.unwrap();
-    assert_eq!(reloaded.values.smart_scheduling, expected);
+    assert_eq!(
+        serde_json::to_value(reloaded.values.smart_scheduling).unwrap(),
+        expected
+    );
+    assert_eq!(reloaded.values.quota_reset_window_weights, windows);
     let snapshot = PgRuntimeSnapshotRepository::new(database.pool.clone())
         .load_runtime_snapshot()
         .await
         .unwrap();
     let snapshot_values = serde_json::to_value(&snapshot.settings).unwrap();
+    assert_eq!(snapshot_values["smart_scheduling"], expected);
     assert_eq!(
-        snapshot_values["smart_scheduling"],
-        serde_json::to_value(expected).unwrap()
+        snapshot_values["quota_reset_window_weights"],
+        serde_json::to_value(windows).unwrap()
     );
     assert!(snapshot.config_revision > before.config_revision);
     sqlx::query("update runtime_settings set smart_scheduling_json = default where id = 1")
@@ -178,7 +193,7 @@ async fn warmup_settings_round_trip_with_database_constraint() {
     let repository = PgRuntimeSettingsRepository::new(database.pool.clone());
     let mut update = settings_with_margin(3_600);
     update.values.account_warmup_enabled = true;
-    update.values.account_warmup_schedule_time = "08:00,13:00".to_owned();
+    update.values.account_warmup_cron = "0 8,13 * * MON-FRI;59 10 * * *".to_owned();
     update.values.account_warmup_model = Some("test-model".to_owned());
     repository
         .update_runtime_settings(update)
@@ -190,7 +205,10 @@ async fn warmup_settings_round_trip_with_database_constraint() {
         .await
         .expect("load warmup settings");
     assert!(settings.values.account_warmup_enabled);
-    assert_eq!(settings.values.account_warmup_schedule_time, "08:00,13:00");
+    assert_eq!(
+        settings.values.account_warmup_cron,
+        "0 8,13 * * MON-FRI;59 10 * * *"
+    );
     assert_eq!(
         settings.values.account_warmup_model.as_deref(),
         Some("test-model")
@@ -556,6 +574,67 @@ async fn retry_after_limit_defaults_and_updates_reach_the_runtime_snapshot() {
 }
 
 #[tokio::test]
+async fn openai_request_settings_round_trip_into_snapshot() {
+    use gateway_core::account::OpenAiRequestCountry;
+    use gateway_store::postgres::{PgRuntimeSnapshotRepository, RuntimeSnapshotRepository};
+    let Some(database) = TestDatabase::create("openai_request_settings").await else {
+        return;
+    };
+    let repository = PgRuntimeSettingsRepository::new(database.pool.clone());
+    let snapshots = PgRuntimeSnapshotRepository::new(database.pool.clone());
+    let initial = snapshots.load_runtime_snapshot().await.unwrap();
+    assert!(initial.settings.openai_oauth_guardian_review_model());
+    assert_eq!(
+        initial.settings.openai_request_country(),
+        &OpenAiRequestCountry::FollowLocation {}
+    );
+
+    for (enabled, country) in [
+        (
+            true,
+            OpenAiRequestCountry::Custom {
+                country: "CA".into(),
+            },
+        ),
+        (true, OpenAiRequestCountry::FollowLocation {}),
+        (false, OpenAiRequestCountry::Passthrough {}),
+        (false, OpenAiRequestCountry::Default {}),
+    ] {
+        let mut update = settings_with_margin(600);
+        update.values.openai_oauth_guardian_review_model = enabled;
+        update.values.openai_request_country = country.clone();
+        repository.update_runtime_settings(update).await.unwrap();
+        let saved = repository.load_runtime_settings().await.unwrap();
+        assert_eq!(saved.values.openai_oauth_guardian_review_model, enabled);
+        assert_eq!(saved.values.openai_request_country, country);
+        let snapshot = snapshots.load_runtime_snapshot().await.unwrap();
+        assert_eq!(
+            snapshot.settings.openai_oauth_guardian_review_model(),
+            enabled
+        );
+        assert_eq!(snapshot.settings.openai_request_country(), &country);
+        assert_eq!(snapshot.config_revision, saved.config_revision);
+    }
+    for invalid in [
+        serde_json::json!({"mode":"custom","country":"ca"}),
+        serde_json::json!({"mode":"custom","country":null}),
+        serde_json::json!({"mode":"custom","country":"CA","extra":1}),
+        serde_json::json!({"mode":"follow_location","country":"CA"}),
+    ] {
+        assert!(
+            sqlx::query(
+                "update runtime_settings set openai_request_country_json = $1 where id = 1"
+            )
+            .bind(sqlx::types::Json(invalid))
+            .execute(&database.pool)
+            .await
+            .is_err()
+        );
+    }
+    database.close().await;
+}
+
+#[tokio::test]
 async fn concurrency_queue_settings_round_trip_into_the_runtime_snapshot() {
     use gateway_store::postgres::{PgRuntimeSnapshotRepository, RuntimeSnapshotRepository};
     let Some(database) = TestDatabase::create("queue_settings").await else {
@@ -568,17 +647,21 @@ async fn concurrency_queue_settings_round_trip_into_the_runtime_snapshot() {
             before.values.max_concurrent_per_account,
             before.values.max_waiting_per_key,
             before.values.max_waiting_per_account,
-            before.values.concurrency_wait_timeout_seconds,
+            before.values.key_queue_timeout_seconds,
+            before.values.account_queue_timeout_seconds,
+            before.values.switch_account_on_queue_failure,
             before.values.openai_guardian_reserved_concurrency,
         ),
-        (3, 10, 10, 30, 5)
+        (3, 10, 10, 30, 30, false, 5)
     );
     let mut update = settings_with_margin(1234);
     update.values.max_concurrent_per_account = 7;
     update.values.refresh_concurrency = 12;
     update.values.max_waiting_per_key = 5;
     update.values.max_waiting_per_account = 7;
-    update.values.concurrency_wait_timeout_seconds = 12;
+    update.values.key_queue_timeout_seconds = 12;
+    update.values.account_queue_timeout_seconds = 5;
+    update.values.switch_account_on_queue_failure = true;
     update.values.openai_guardian_reserved_concurrency = 1;
     repository.update_runtime_settings(update).await.unwrap();
     let settings = repository.load_runtime_settings().await.unwrap();
@@ -589,10 +672,12 @@ async fn concurrency_queue_settings_round_trip_into_the_runtime_snapshot() {
             settings.values.refresh_margin_seconds,
             settings.values.max_waiting_per_key,
             settings.values.max_waiting_per_account,
-            settings.values.concurrency_wait_timeout_seconds,
+            settings.values.key_queue_timeout_seconds,
+            settings.values.account_queue_timeout_seconds,
+            settings.values.switch_account_on_queue_failure,
             settings.values.openai_guardian_reserved_concurrency,
         ),
-        (7, 12, 1234, 5, 7, 12, 1)
+        (7, 12, 1234, 5, 7, 12, 5, true, 1)
     );
     let snapshot = PgRuntimeSnapshotRepository::new(database.pool.clone())
         .load_runtime_snapshot()
@@ -606,14 +691,20 @@ async fn concurrency_queue_settings_round_trip_into_the_runtime_snapshot() {
                 .unwrap(),
             snapshot_values["max_waiting_per_key"].as_u64().unwrap(),
             snapshot_values["max_waiting_per_account"].as_u64().unwrap(),
-            snapshot_values["concurrency_wait_timeout_seconds"]
+            snapshot_values["key_queue_timeout_seconds"]
+                .as_u64()
+                .unwrap(),
+            snapshot_values["switch_account_on_queue_failure"]
+                .as_bool()
+                .unwrap(),
+            snapshot_values["account_queue_timeout_seconds"]
                 .as_u64()
                 .unwrap(),
             snapshot_values["openai_guardian_reserved_concurrency"]
                 .as_u64()
                 .unwrap(),
         ),
-        (7, 5, 7, 12, 1)
+        (7, 5, 7, 12, true, 5, 1)
     );
     assert!(snapshot.config_revision > before.config_revision);
     database.close().await;
@@ -995,6 +1086,13 @@ async fn request_profile_projection_is_revision_consistent_and_includes_key_over
     };
     let repository = PgRuntimeSettingsRepository::new(database.pool.clone());
     let provider = ProviderKind::new("xai").unwrap();
+    assert!(
+        repository
+            .load_request_profile(&provider)
+            .await
+            .unwrap()
+            .is_none()
+    );
     let document = |marker: &str| {
         OpaqueProviderData::new(
             serde_json::json!({"marker":marker})
@@ -1036,6 +1134,10 @@ async fn request_profile_projection_is_revision_consistent_and_includes_key_over
     assert_eq!(profiles.len(), 2);
     assert!(profiles.contains(&document("global")));
     assert!(profiles.contains(&document("key")));
+    assert_eq!(
+        repository.load_request_profile(&provider).await.unwrap(),
+        Some(document("global"))
+    );
 
     repository
         .update_runtime_settings(settings_with_margin(7200))
@@ -1234,19 +1336,15 @@ async fn reset_credit_weekly_threshold_defaults_unset_and_round_trips() {
         settings.values.reset_credit_max_weekly_remaining_percent,
         None
     );
+    assert!(!settings.values.reset_credit_on_low_weekly_quota);
     for threshold in [Some(70), Some(0), Some(100), None] {
         let mut update = settings_with_margin(600);
+        update.values.reset_credit_on_low_weekly_quota = true;
         update.values.reset_credit_max_weekly_remaining_percent = threshold;
         repository.update_runtime_settings(update).await.unwrap();
-        assert_eq!(
-            repository
-                .load_runtime_settings()
-                .await
-                .unwrap()
-                .values
-                .reset_credit_max_weekly_remaining_percent,
-            threshold
-        );
+        let values = repository.load_runtime_settings().await.unwrap().values;
+        assert!(values.reset_credit_on_low_weekly_quota);
+        assert_eq!(values.reset_credit_max_weekly_remaining_percent, threshold);
     }
     for threshold in [-1, 101] {
         assert!(sqlx::query("update runtime_settings set reset_credit_max_weekly_remaining_percent = $1 where id = 1")

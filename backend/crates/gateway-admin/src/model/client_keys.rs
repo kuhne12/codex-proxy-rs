@@ -219,6 +219,66 @@ pub struct UpdateClientKey {
     pub weekly_limit_usd: Option<gateway_core::metering::Decimal>,
 }
 
+/// 批量编辑只覆盖明确选择的互联选项
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ClientPeerSharingPatch {
+    pub enabled: Option<bool>,
+    pub share_pool: Option<bool>,
+    pub share_quota: Option<bool>,
+    pub share_plans: Option<bool>,
+}
+
+impl ClientPeerSharingPatch {
+    #[must_use]
+    pub fn is_empty(self) -> bool {
+        self == Self::default()
+    }
+
+    #[must_use]
+    pub fn apply(
+        self,
+        current: gateway_core::policy::ClientPeerSharing,
+    ) -> gateway_core::policy::ClientPeerSharing {
+        gateway_core::policy::ClientPeerSharing {
+            enabled: self.enabled.unwrap_or(current.enabled),
+            share_pool: self.share_pool.unwrap_or(current.share_pool),
+            share_quota: self.share_quota.unwrap_or(current.share_quota),
+            share_plans: self.share_plans.unwrap_or(current.share_plans),
+        }
+    }
+}
+
+/// 对各个密钥独立应用同一份局部设置
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BatchUpdateClientKeys {
+    pub ids: Vec<ClientApiKeyId>,
+    pub group_ids: Option<Vec<AccountGroupId>>,
+    pub enabled: Option<bool>,
+    pub max_concurrency: Option<u64>,
+    pub requests_per_minute: Option<u64>,
+    pub daily_limit_usd: Option<gateway_core::metering::Decimal>,
+    pub weekly_limit_usd: Option<gateway_core::metering::Decimal>,
+    pub peer_sharing: ClientPeerSharingPatch,
+    pub request_profile_override_updates: ProviderRequestProfileOverrideUpdates,
+    pub installation_seed: Option<uuid::Uuid>,
+}
+
+impl BatchUpdateClientKeys {
+    #[must_use]
+    pub fn has_changes(&self) -> bool {
+        self.group_ids.is_some()
+            || self.enabled.is_some()
+            || self.max_concurrency.is_some()
+            || self.requests_per_minute.is_some()
+            || self.daily_limit_usd.is_some()
+            || self.weekly_limit_usd.is_some()
+            || !self.peer_sharing.is_empty()
+            || !self.request_profile_override_updates.is_empty()
+            || self.installation_seed.is_some()
+    }
+}
+
 /// 修改 Client Key 启用状态
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SetClientKeyEnabled {
@@ -234,11 +294,114 @@ pub enum ClientKeyBudgetPeriod {
     All,
 }
 
-/// 清零所选窗口已用金额，保留限额、到期时间与历史费用
+/// 清零所选窗口并恢复日历规则，保留限额与历史费用
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResetClientKeyBudget {
     pub id: ClientApiKeyId,
     pub period: ClientKeyBudgetPeriod,
+}
+
+/// 显式窗口复用已有日／周金额上限，外部周期的选择归调用方
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClientKeyBudgetWindowPeriod {
+    Daily,
+    Weekly,
+}
+
+impl ClientKeyBudgetWindowPeriod {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Daily => "daily",
+            Self::Weekly => "weekly",
+        }
+    }
+}
+
+/// 手动对齐只需要账号身份，列表不读取凭据、额度或用量
+#[derive(serde::Serialize, Debug)]
+pub struct BudgetReferenceAccount {
+    pub id: String,
+    pub name: String,
+    pub email: Option<String>,
+    pub provider: String,
+}
+
+#[derive(serde::Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct BudgetReferenceAccountPage {
+    pub items: Vec<BudgetReferenceAccount>,
+    pub next_cursor: Option<String>,
+}
+
+/// 管理员可预览的账号窗口保留 Provider 的稳定标识
+pub struct ClientKeyBudgetReference {
+    pub key: String,
+    pub label: String,
+    pub period: ClientKeyBudgetWindowPeriod,
+    pub bounds: ExplicitClientKeyBudgetWindow,
+}
+
+impl ClientKeyBudgetReference {
+    /// 只取整账号当前的日／周窗口，对齐结束后恢复密钥自身周期
+    pub fn from_current_window(
+        window: super::provider_credentials::ProviderQuotaWindow,
+        now: DateTime<Utc>,
+    ) -> Option<Self> {
+        use super::provider_credentials::QuotaLocalUsageAttribution;
+        if window.local_usage_attribution != QuotaLocalUsageAttribution::AccountWide
+            || window
+                .upstream
+                .as_ref()
+                .is_some_and(|upstream| upstream.stale)
+        {
+            return None;
+        }
+        let period = match window.window_seconds? {
+            86_400 => ClientKeyBudgetWindowPeriod::Daily,
+            604_800 => ClientKeyBudgetWindowPeriod::Weekly,
+            _ => return None,
+        };
+        let (starts_at, ends_at) = window.observed_bounds()?;
+        (starts_at..ends_at).contains(&now).then_some(Self {
+            key: window.key,
+            label: window.label,
+            period,
+            bounds: ExplicitClientKeyBudgetWindow {
+                starts_at,
+                ends_at,
+                resume_calendar: true,
+            },
+        })
+    }
+}
+
+/// 按请求完成时间归属的左闭右开预算窗口
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExplicitClientKeyBudgetWindow {
+    /// 一次性对齐的窗口到期后恢复原生滚动
+    pub resume_calendar: bool,
+    pub starts_at: DateTime<Utc>,
+    pub ends_at: DateTime<Utc>,
+}
+
+/// 窗口配置版本独立于费用累计与全局配置版本
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientKeyBudgetWindow {
+    pub revision: u64,
+    pub explicit: bool,
+    pub starts_at: Option<DateTime<Utc>>,
+    pub ends_at: Option<DateTime<Utc>>,
+    pub used_usd: gateway_core::metering::Decimal,
+}
+
+/// 当前窗口版本标识一次操作，同版本同参数可重试；None 释放显式控制
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetClientKeyBudgetWindow {
+    pub id: ClientApiKeyId,
+    pub period: ClientKeyBudgetWindowPeriod,
+    pub expected_revision: u64,
+    pub window: Option<ExplicitClientKeyBudgetWindow>,
 }
 
 /// 仅更新指定金额上限；省略的周期保持不变，不修改已用金额或窗口

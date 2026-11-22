@@ -1,5 +1,6 @@
 //! 在出站副本中隔离账号的追踪标识，不改变本地亲和、续接引用或业务正文
 
+use gateway_protocol::openai::CodexGuardianRole;
 use reqwest::header::{HeaderMap, HeaderValue};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
@@ -14,6 +15,7 @@ const ID_FIELDS: &[&str] = &[
     "window_id",
     "context_window_id",
     "parent_thread_id",
+    "guardian_classifier_source_thread_id",
     "forked_from_thread_id",
     "conversation_id",
     "x-codex-window-id",
@@ -41,10 +43,33 @@ fn scoped_id(installation_id: &str, original: &str) -> String {
     let hash = digest.finalize();
     let mut bytes = [0_u8; 16];
     bytes.copy_from_slice(&hash[..16]);
-    // 保持官方 UUID 的形状；各类引用共享映射，保留相同原值的等值关系
-    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    if let Some(id) = uuid::Uuid::parse_str(original).ok().filter(|id| {
+        id.get_version() == Some(uuid::Version::SortRand)
+            && id.get_variant() == uuid::Variant::RFC4122
+    }) {
+        // 官方线程与会话使用 UUIDv7；保留毫秒时间，仅按账号隔离随机部分
+        bytes[..6].copy_from_slice(&id.as_bytes()[..6]);
+        bytes[6] = (bytes[6] & 0x0f) | 0x70;
+    } else {
+        // 自定义缓存键及非 v7 标识沿用稳定映射，不为它们补造创建时间
+        bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    }
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
     uuid::Uuid::from_bytes(bytes).to_string()
+}
+
+fn scoped_field_id(installation_id: &str, field: &str, original: &str) -> String {
+    // context_window_id 是独立标识，仅官方复合窗口字段引用 thread_id
+    if matches!(field, "window_id" | "x-codex-window-id" | "codexWindowId")
+        && let Some((thread_id, number)) = original.split_once(':')
+        && uuid::Uuid::parse_str(thread_id).is_ok()
+        && number
+            .parse::<u64>()
+            .is_ok_and(|value| value.to_string() == number)
+    {
+        return format!("{}:{number}", scoped_id(installation_id, thread_id));
+    }
+    scoped_id(installation_id, original)
 }
 
 /// Search 的 id 是会话关联键，仅替换该值的原始字节，保留其他字段、重复键和空白
@@ -85,7 +110,7 @@ fn map_fields(object: &mut Map<String, Value>, installation_id: &str, fields: &[
         if let Some(Value::String(value)) = object.get_mut(*key)
             && !value.is_empty()
         {
-            *value = scoped_id(installation_id, value);
+            *value = scoped_field_id(installation_id, key, value);
             changed += 1;
         }
     }
@@ -123,7 +148,7 @@ pub(super) fn scope_headers(headers: &mut HeaderMap, installation_id: Option<&st
                     .ok()
                     .filter(|value| !value.is_empty())
                     .and_then(|value| {
-                        HeaderValue::from_str(&scoped_id(installation_id, value)).ok()
+                        HeaderValue::from_str(&scoped_field_id(installation_id, name, value)).ok()
                     })
                     .unwrap_or_else(|| value.clone())
             })
@@ -154,10 +179,33 @@ pub(super) fn scope_headers(headers: &mut HeaderMap, installation_id: Option<&st
     }
 }
 
+fn guardian_cache_key(
+    metadata: &Value,
+    role: CodexGuardianRole,
+    cache: &str,
+    installation_id: &str,
+) -> Option<String> {
+    let (prefix, original) = cache.split_once(':')?;
+    uuid::Uuid::parse_str(original).ok()?;
+    let source = match (role, prefix) {
+        (CodexGuardianRole::Reviewer, "guardian") => {
+            metadata.get("x-codex-parent-thread-id")?.as_str()? == original
+        }
+        (CodexGuardianRole::Classifier, "guardian-v2") => {
+            let turn: Value =
+                serde_json::from_str(metadata.get("x-codex-turn-metadata")?.as_str()?).ok()?;
+            turn.get("guardian_classifier_source_thread_id")?.as_str()? == original
+        }
+        _ => return None,
+    };
+    source.then(|| format!("{prefix}:{}", scoped_id(installation_id, original)))
+}
+
 pub(super) fn scope_request(
     body: &mut Value,
     headers: &mut HeaderMap,
     installation_id: Option<&str>,
+    guardian: Option<CodexGuardianRole>,
 ) {
     scope_headers(headers, installation_id);
     let Some(installation_id) = installation_id else {
@@ -165,7 +213,19 @@ pub(super) fn scope_request(
     };
     if let Some(object) = body.as_object_mut() {
         map_fields(object, installation_id, ID_FIELDS);
-        map_fields(object, installation_id, &["prompt_cache_key"]);
+        // 官方 Guardian 的复合缓存键引用父线程；自定义键仍作为一个整体隔离
+        if let Some(cache) = object
+            .get("prompt_cache_key")
+            .and_then(Value::as_str)
+            .filter(|v| !v.is_empty())
+        {
+            let mapped = guardian
+                .and_then(|role| {
+                    guardian_cache_key(object.get("client_metadata")?, role, cache, installation_id)
+                })
+                .unwrap_or_else(|| scoped_id(installation_id, cache));
+            object.insert("prompt_cache_key".into(), Value::from(mapped));
+        }
         for key in METADATA_FIELDS {
             if let Some(value) = object.get_mut(*key) {
                 scope_metadata(value, installation_id);

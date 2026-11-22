@@ -1,6 +1,6 @@
 //! 请求认证时冻结的账号范围与目录，不依赖路由选择器
 
-use super::{FastMode, ProviderAccountId};
+use super::{AccountModelAccess, FastMode, ProviderAccountId};
 use crate::identity::ProviderKind;
 use crate::validation::{IdentifierError, RoutingError};
 use std::{
@@ -107,6 +107,7 @@ pub struct RuntimeAccountDirectory {
     accounts: BTreeMap<ProviderAccountId, RuntimeAccount>,
     providers_with_accounts: BTreeSet<ProviderKind>,
     providers_by_group: BTreeMap<AccountGroupId, BTreeSet<ProviderKind>>,
+    group_model_access: BTreeMap<AccountGroupId, AccountModelAccess>,
 }
 
 impl RuntimeAccountDirectory {
@@ -127,7 +128,26 @@ impl RuntimeAccountDirectory {
             accounts,
             providers_with_accounts,
             providers_by_group,
+            group_model_access: BTreeMap::new(),
         }
+    }
+
+    #[must_use]
+    pub fn with_group_model_access(
+        mut self,
+        policies: BTreeMap<AccountGroupId, AccountModelAccess>,
+    ) -> Self {
+        self.group_model_access = policies;
+        self
+    }
+
+    pub(crate) fn accounts_in_group(
+        &self,
+        group: &AccountGroupId,
+    ) -> impl Iterator<Item = (&ProviderAccountId, &RuntimeAccount)> {
+        self.accounts
+            .iter()
+            .filter(move |(_, account)| account.group_ids.contains(group))
     }
 
     #[must_use]
@@ -267,7 +287,7 @@ impl ClientRoutingScope {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FrozenAccountScope {
     allow_image_generation: bool,
-    direct_accounts_only: bool,
+    allow_subagents: bool,
     fast_mode: FastMode,
     request_profiles: BTreeMap<ProviderKind, super::OpaqueProviderData>,
     directory: Arc<RuntimeAccountDirectory>,
@@ -278,27 +298,16 @@ pub struct FrozenAccountScope {
 }
 
 impl FrozenAccountScope {
-    /// 枚举冻结权限实际允许的账号，保留所有既有直连和分组约束
+    /// 枚举冻结权限实际允许的账号，保留所有分组和请求局部约束
     pub fn allowed_account_ids(&self) -> impl Iterator<Item = &ProviderAccountId> {
         self.directory.accounts.keys().filter(|id| self.allows(id))
     }
 
-    /// 互联限制与原账号范围取交集，分组变更和请求局部重选均不能扩大它
+    /// 共享 Key 删除最后一个分组后保持空池，不得回退到全池
     #[must_use]
-    pub fn with_direct_accounts_only(mut self, enabled: bool) -> Self {
-        self.direct_accounts_only = enabled;
-        if enabled {
-            self.provider_kinds = Arc::new(
-                self.provider_kinds
-                    .iter()
-                    .filter(|provider| {
-                        self.directory.accounts.iter().any(|(id, account)| {
-                            account.provider_kind() == *provider && self.allows(id)
-                        })
-                    })
-                    .cloned()
-                    .collect(),
-            );
+    pub fn requiring_groups(mut self) -> Self {
+        if matches!(self.client_scope, ClientRoutingScope::AllAccounts) {
+            self.provider_kinds = Arc::default();
         }
         self
     }
@@ -313,6 +322,11 @@ impl FrozenAccountScope {
     #[must_use]
     pub const fn allows_image_generation(&self) -> bool {
         self.allow_image_generation
+    }
+
+    #[must_use]
+    pub const fn allows_subagents(&self) -> bool {
+        self.allow_subagents
     }
 
     /// 与 Key 授权范围一同冻结；具体字段只由对应 Provider 解释
@@ -335,6 +349,12 @@ impl FrozenAccountScope {
         &self.request_profiles
     }
 
+    #[must_use]
+    pub const fn with_subagents(mut self, allowed: bool) -> Self {
+        self.allow_subagents = allowed;
+        self
+    }
+
     /// Key 绑定分组的冻结 Fast 策略，与账号成员资格无关
     #[must_use]
     pub const fn with_fast_mode(mut self, fast_mode: FastMode) -> Self {
@@ -355,7 +375,7 @@ impl FrozenAccountScope {
         };
         Self {
             allow_image_generation: true,
-            direct_accounts_only: false,
+            allow_subagents: true,
             fast_mode: FastMode::Default,
             request_profiles: BTreeMap::new(),
             directory,
@@ -412,18 +432,24 @@ impl FrozenAccountScope {
 
     #[must_use]
     pub fn allows(&self, account_id: &ProviderAccountId) -> bool {
+        self.allows_with_policy(account_id, |_| true)
+    }
+
+    fn allows_with_policy(
+        &self,
+        account_id: &ProviderAccountId,
+        accepts: impl Fn(&AccountModelAccess) -> bool,
+    ) -> bool {
         let Some(account) = self.directory.account(account_id) else {
             return false;
         };
-        if (self.direct_accounts_only
-            && (!account.is_direct_account()
-                || matches!(self.client_scope, ClientRoutingScope::AllAccounts)))
-            || self.excluded_account_ids.contains(account_id)
+        if self.excluded_account_ids.contains(account_id)
             || !self.provider_kinds.contains(account.provider_kind())
             || self
                 .allowed_account_ids
                 .as_ref()
                 .is_some_and(|accounts| !accounts.contains(account_id))
+            || !accepts(account.model_access())
         {
             return false;
         }
@@ -433,28 +459,43 @@ impl FrozenAccountScope {
                 enabled_group_ids, ..
             } => account
                 .group_ids()
-                .iter()
-                .any(|group_id| enabled_group_ids.contains(group_id)),
+                .intersection(enabled_group_ids)
+                .any(|id| {
+                    self.directory
+                        .group_model_access
+                        .get(id)
+                        .is_none_or(&accepts)
+                }),
         }
     }
 
     #[must_use]
     pub fn allows_model(&self, account_id: &ProviderAccountId, upstream_model: &str) -> bool {
-        self.allows(account_id)
-            && self
-                .directory
-                .account(account_id)
-                .is_some_and(|account| account.model_access.allows(upstream_model))
+        self.allows_with_policy(account_id, |access| access.allows(upstream_model))
     }
 
-    /// 当前凭据类型必须与已授权的直连事实相同，快照发布间隙不能转成代理账号
+    /// 不猜测原生端点的默认模型，账号与授权它的分组均须允许任意模型
     #[must_use]
-    pub fn allows_current_account(&self, account: &super::ProviderAccount) -> bool {
-        self.allows(account.id())
-            && (!self.direct_accounts_only
-                || self.directory.account(account.id()).is_some_and(|frozen| {
-                    frozen.direct_authentication_kind() == Some(account.authentication_kind())
-                }))
+    pub fn allows_unidentified_model(&self, account_id: &ProviderAccountId) -> bool {
+        self.allows_with_policy(account_id, |access| access.allows_optional_model(None))
+    }
+
+    /// 只报告所有已启用绑定分组均明确拒绝模型的情况，空池沿用原路由错误
+    #[must_use]
+    pub fn groups_deny_model(&self, upstream_model: Option<&str>) -> bool {
+        let ClientRoutingScope::Restricted {
+            enabled_group_ids, ..
+        } = &self.client_scope
+        else {
+            return false;
+        };
+        !enabled_group_ids.is_empty()
+            && enabled_group_ids.iter().all(|id| {
+                self.directory
+                    .group_model_access
+                    .get(id)
+                    .is_some_and(|access| !access.allows_optional_model(upstream_model))
+            })
     }
 
     /// 目录按整个授权账号池过滤，不能只看用于获取元数据的账号政策

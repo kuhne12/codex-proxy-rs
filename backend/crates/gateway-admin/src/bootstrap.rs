@@ -183,7 +183,7 @@ async fn initialize_inner(
             PluginDistributionPorts::new(plugin_distribution, store.proxies()),
             snapshot.clone(),
             plugin_preparation,
-            published_snapshot,
+            published_snapshot.clone(),
             store.plugin_state(),
         )),
         key_usage,
@@ -201,6 +201,7 @@ async fn initialize_inner(
             store.account_groups(),
             store.account_runtime(),
             snapshot.clone(),
+            published_snapshot,
         )),
         client_keys: Arc::new(DefaultClientKeyService::new(
             store.client_keys(),
@@ -262,6 +263,14 @@ pub fn initialize_plugin_accounts(
         snapshot,
         upstream_info,
     ))
+}
+
+/// 为 Runtime 创建代理目录与当前出口解析的窄端口
+#[must_use]
+pub fn initialize_plugin_proxies(
+    store: Arc<dyn ports::proxy::ProxyStore>,
+) -> Arc<dyn ports::proxy::PluginProxyAccess> {
+    Arc::new(use_case::proxies::DefaultPluginProxyAccess { store })
 }
 
 /// 为 Runtime 创建非秘密 Client Key 目录与预算重置的窄端口

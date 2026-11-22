@@ -442,29 +442,14 @@ mod provider {
             *fixture.account.lock().unwrap() = Some(account(provider));
             for (kind, status, code, message) in [
                 (Kind::Invalid, 400, 40001, "刷新令牌已被使用，请重新授权"),
-                (
-                    Kind::Conflict,
-                    409,
-                    40901,
-                    "令牌刷新繁忙，请等待当前刷新完成后重试",
-                ),
-                (
-                    Kind::BadGateway,
-                    502,
-                    50201,
-                    "OpenAI 返回的 Codex PAT 身份资料不完整或格式无效，请稍后重试",
-                ),
-                (
-                    Kind::Unavailable,
-                    503,
-                    50301,
-                    "暂时无法向 OpenAI 验证 Codex PAT，请稍后重试",
-                ),
+                (Kind::Conflict, 409, 40901, "令牌刷新繁忙，请稍后重试"),
+                (Kind::BadGateway, 502, 50201, "PAT 身份信息无效"),
+                (Kind::Unavailable, 503, 50301, "PAT 验证服务暂不可用"),
                 (
                     Kind::Ambiguous,
                     502,
                     50202,
-                    "令牌刷新结果未知，请先核对账号状态，不要立即重复刷新",
+                    "刷新结果未知，核对账号状态前请勿重试",
                 ),
             ] {
                 *fixture.provider_error.lock().unwrap() = Some(
@@ -513,6 +498,12 @@ mod provider {
             (Kind::Unsupported, 400, 40001, "该服务商不支持此操作"),
             (Kind::BadGateway, 502, 50201, "上游服务请求失败"),
             (Kind::Unavailable, 503, 50301, "服务商暂不可用"),
+            (
+                Kind::CredentialRefreshRequired,
+                503,
+                50301,
+                "账号凭据需要刷新",
+            ),
             (
                 Kind::Ambiguous,
                 502,
@@ -563,6 +554,7 @@ mod provider {
     fn account(provider: &str) -> AccountPageItem {
         let now = Utc::now();
         let facts = AccountStatusFacts {
+            quota_paused: false,
             enabled: true,
             credential_state: CredentialState::Ready,
             access_token_expires_at: None,
@@ -578,6 +570,9 @@ mod provider {
                 total_slots: None,
             },
             account: AccountRecord {
+                quota_paused: false,
+                quota_settings: Default::default(),
+                auto_use_quota_credits: false,
                 outbound_proxy_id: None,
                 outbound_proxy_enabled: true,
                 notes: None,

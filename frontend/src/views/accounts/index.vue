@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import type { Account } from '@/api'
-import { useTableColumns, ZCard, ZCheckbox, ZConfirmDialog, ZPageHeader, ZPagination, ZTable, ZTableColumnSettings } from '@codex-proxy/ui'
+
+import { useTableColumns, ZCard, ZCheckbox, ZConfirmDialog, ZIconButton, ZPageHeader, ZPagination, ZTable, ZTableColumnSettings } from '@codex-proxy/ui'
 
 import { ChevronDown } from '@lucide/vue'
 
@@ -144,7 +145,7 @@ const {
   connectionTestStartedAt,
   connectionTestFinishedAt,
   connectionTestDurationMs,
-  testingConnectionIds,
+  testingAccountId,
   loadingConnectionTestModels,
   refreshingConnectionTestModels,
   connectionTestSelectedModel,
@@ -215,7 +216,7 @@ const ui = useUiStore()
 </script>
 
 <template>
-  <div class="flex min-h-0 w-full flex-col xl:h-full xl:overflow-hidden">
+  <div class="flex min-h-0 w-full flex-col xl:h-[calc(100dvh-3rem)] xl:flex-none!">
     <ZPageHeader
       :title="t('navigation.accounts')"
       :description="t('accounts.page.description')"
@@ -224,7 +225,7 @@ const ui = useUiStore()
     <AccountOverviewCards :summary="accountSummary" />
 
     <ZCard
-      class="mt-4 flex flex-col xl:h-[calc(100dvh-250px)] xl:min-h-125"
+      class="mt-4 flex flex-col xl:min-h-80 xl:flex-1"
     >
       <template #header>
         <AccountFilters
@@ -271,17 +272,18 @@ const ui = useUiStore()
             @sort-change="handleSortChange"
           >
             <template #expander="{ row }">
-              <button
-                type="button"
-                class="inline-flex size-6 cursor-pointer items-center justify-center rounded-md border-0 bg-transparent text-z-text-secondary transition hover:bg-z-bg-text-hover hover:text-z-text"
-                :title="expandedAccountIds.has(row.id) ? t('accounts.page.collapseStatistics') : t('accounts.page.expandStatistics')"
+              <ZIconButton
+                size="small"
+                class="size-6! rounded-md! hover:bg-z-bg-text-hover!"
+                :aria-label="expandedAccountIds.has(row.id) ? t('accounts.page.collapseStatistics') : t('accounts.page.expandStatistics')"
+                :aria-expanded="expandedAccountIds.has(row.id)"
                 @click.stop="toggleExpanded(row.id)"
               >
                 <ChevronDown
                   class="size-3.5 transition-transform"
                   :class="expandedAccountIds.has(row.id) ? '' : '-rotate-90'"
                 />
-              </button>
+              </ZIconButton>
             </template>
 
             <template #header-selection>
@@ -314,6 +316,7 @@ const ui = useUiStore()
 
             <template #status="{ row }">
               <AccountStatusBadge
+                :quota="row.quota"
                 :status="row.status"
                 :error-reason="row.errorReason"
                 :error-message="row.errorMessage"
@@ -327,8 +330,8 @@ const ui = useUiStore()
             </template>
 
             <template #planType="{ row }">
-              <div class="flex min-w-0 justify-center">
-                <AccountPlanBadge :upstream="row.upstream" :authentication-kind="row.authenticationKind" :plan-type="row.planType" :plan-type-display="row.planTypeDisplay" />
+              <div class="-mx-3 flex min-w-0 justify-center">
+                <AccountPlanBadge wrap :upstream="row.upstream" :authentication-kind="row.authenticationKind" :plan-type="row.planType" :plan-type-display="row.planTypeDisplay" />
               </div>
             </template>
 
@@ -353,7 +356,7 @@ const ui = useUiStore()
                 :downloading-catalog="downloadingCatalogAccountIds.has(row.id)"
                 :recovering="recoveringAccountIds.has(row.id)"
                 :refreshing="refreshingAccountIds.has(row.id)"
-                :testing="testingConnectionIds.has(row.id)"
+                :testing="testingAccountId === row.id"
                 :toggling-scheduling="togglingSchedulingAccountIds.has(row.id)"
                 @edit="openAccountEdit"
                 @delete="requestDeleteAccount"

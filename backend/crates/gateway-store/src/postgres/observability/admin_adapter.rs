@@ -41,7 +41,7 @@ impl PgObservabilityRepository {
         self
     }
 
-    /// 从账号事实和当前冷却一次性派生 Dashboard 五态；不在 SQL 中复制状态机
+    /// 从账号事实和当前冷却一次性派生 Dashboard 状态；不在 SQL 中复制状态机
     async fn account_status_snapshot(
         &self,
         observed_at: DateTime<Utc>,
@@ -68,6 +68,9 @@ impl PgObservabilityRepository {
                 gateway_core::account::AccountStatus::Normal => {
                     metrics.normal = metrics.normal.saturating_add(1);
                     normal_accounts.push(account);
+                }
+                gateway_core::account::AccountStatus::QuotaPaused => {
+                    metrics.quota_paused = metrics.quota_paused.saturating_add(1);
                 }
                 gateway_core::account::AccountStatus::QuotaExhausted => {
                     metrics.quota_exhausted = metrics.quota_exhausted.saturating_add(1);
@@ -506,6 +509,57 @@ impl AdminObservabilityStore for PgAdminObservabilityStore {
             .into_iter()
             .map(admin_request_metric_point)
             .collect())
+    }
+
+    async fn client_key_statistics(
+        &self,
+        range: admin_observability::TimeRange,
+        id: &gateway_core::policy::ClientApiKeyId,
+        query: admin_observability::KeyUsageMetric,
+    ) -> AdminStoreResult<admin_observability::KeyStatisticsOverview> {
+        let range = store_range(range).map_err(observability_error)?;
+        let timezone = self.repository.timezone;
+        self.repository
+            .query_budget
+            .run(
+                &self.repository.pool,
+                "load key usage statistics",
+                |mut connection| async move {
+                    let mut snapshot = AnalyticsSnapshot::new(&mut connection).await?;
+                    let result = snapshot
+                        .client_key_statistics(range, id.as_str(), timezone, query)
+                        .await?;
+                    snapshot.finish().await?;
+                    Ok(result)
+                },
+            )
+            .await
+            .map_err(observability_error)
+    }
+
+    async fn client_key_models(
+        &self,
+        range: admin_observability::TimeRange,
+        id: &gateway_core::policy::ClientApiKeyId,
+    ) -> AdminStoreResult<Vec<admin_observability::KeyModelRow>> {
+        let range = store_range(range).map_err(observability_error)?;
+        let timezone = self.repository.timezone;
+        self.repository
+            .query_budget
+            .run(
+                &self.repository.pool,
+                "load key usage statistics",
+                |mut connection| async move {
+                    let mut snapshot = AnalyticsSnapshot::new(&mut connection).await?;
+                    let result = snapshot
+                        .client_key_models(range, id.as_str(), timezone)
+                        .await?;
+                    snapshot.finish().await?;
+                    Ok(result)
+                },
+            )
+            .await
+            .map_err(observability_error)
     }
 
     async fn usage_trend(

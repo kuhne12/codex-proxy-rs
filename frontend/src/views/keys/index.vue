@@ -12,6 +12,7 @@ import { useAccountGroupCatalog } from '@/composables/useAccountGroupCatalog'
 import { usePageSelection } from '@/composables/usePageSelection'
 import { useUiStore } from '@/stores/modules/ui'
 import ApiKeyActions from './components/ApiKeyActions.vue'
+import ApiKeyBatchEditModal from './components/ApiKeyBatchEditModal.vue'
 import ApiKeyBudgetCell from './components/ApiKeyBudgetCell.vue'
 import ApiKeyBudgetResetModal from './components/ApiKeyBudgetResetModal.vue'
 import ApiKeyCreatedModal from './components/ApiKeyCreatedModal.vue'
@@ -20,6 +21,7 @@ import ApiKeyFormModal from './components/ApiKeyFormModal.vue'
 import ApiKeyIdentityCell from './components/ApiKeyIdentityCell.vue'
 import ApiKeyPrefixCell from './components/ApiKeyPrefixCell.vue'
 import ApiKeyScopeCell from './components/ApiKeyScopeCell.vue'
+import ApiKeyStatisticsModal from './components/ApiKeyStatisticsModal.vue'
 import ApiKeyStatusBadge from './components/ApiKeyStatusBadge.vue'
 import { useApiKeyEditor } from './composables/useApiKeyEditor'
 import { useApiKeyMutations } from './composables/useApiKeyMutations'
@@ -35,7 +37,10 @@ const selectedIds = ref<Set<string>>(new Set())
 watch(() => ui.showPluginKeys, () => {
   selectedIds.value = new Set()
 })
+const showBatchEdit = shallowRef(false)
+const batchKeys = shallowRef<ApiKey[]>([])
 const showBudgetResetModal = shallowRef(false)
+const statisticsKey = shallowRef<ApiKey | null>(null)
 const resettingKey = shallowRef<ApiKey | null>(null)
 
 function openBudgetReset(key: ApiKey) {
@@ -111,10 +116,45 @@ const { allSelected, indeterminate, selectedRowKeys, toggleSelection, toggleAll 
   selectedIds,
 )
 
-watch(
-  showFormModal,
-  open => open && void loadGroups(),
-)
+// 翻页后仍可批量编辑，保留每个勾选项最近一次载入的配置。
+const selectedKeys = new Map<string, ApiKey>()
+watch([selectedIds, apiKeys], ([ids, rows]) => {
+  for (const id of selectedKeys.keys()) {
+    if (!ids.has(id))
+      selectedKeys.delete(id)
+  }
+  for (const row of rows) {
+    if (ids.has(row.id))
+      selectedKeys.set(row.id, row)
+  }
+}, { flush: 'sync' })
+
+function editSelectedKeys() {
+  const keys = [
+    ...selectedKeys.values(),
+  ]
+  const [first] = keys
+  if (keys.length === 1 && first) {
+    openEdit(first)
+  }
+  else if (keys.length > 1) {
+    batchKeys.value = keys
+    showBatchEdit.value = true
+  }
+}
+
+function finishBatchEdit(ids: string[]) {
+  const remaining = new Set(selectedIds.value)
+  for (const id of ids)
+    remaining.delete(id)
+  selectedIds.value = remaining
+  void loadApiKeys()
+}
+
+watch([showFormModal, showBatchEdit], ([editor, batch]) => {
+  if (editor || batch)
+    void loadGroups()
+})
 </script>
 
 <template>
@@ -133,6 +173,7 @@ watch(
           :batch-deleting="batchDeleting"
           :selected-count="selectedIds.size"
           @create="openCreate"
+          @edit-selected="editSelectedKeys"
           @delete-selected="showDeleteModal = true"
         />
       </template>
@@ -211,6 +252,7 @@ watch(
                 :configuring="revealingKeys.get(row.id) === 'use'"
                 :updating-status="updatingStatusKeyIds.has(row.id)"
                 @edit="openEdit"
+                @statistics="statisticsKey = $event"
                 @reset-budget="openBudgetReset"
                 @delete="requestDeleteKey"
                 @import-client="openImportKeyModal"
@@ -229,6 +271,9 @@ watch(
       </template>
     </ZCard>
 
+    <ApiKeyBatchEditModal
+      v-model="showBatchEdit" :keys="batchKeys" :groups="groups" :group-loading="loadingGroups" @saved="finishBatchEdit"
+    />
     <ApiKeyFormModal
       v-model="showFormModal"
       v-model:form="form"
@@ -247,6 +292,8 @@ watch(
       @import-client="importCreatedKey"
       @after-leave="clearCreatedKey"
     />
+
+    <ApiKeyStatisticsModal v-if="statisticsKey" :api-key="statisticsKey" @close="statisticsKey = null" />
 
     <ApiKeyBudgetResetModal
       v-model="showBudgetResetModal"
