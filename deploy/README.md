@@ -910,7 +910,8 @@ OAuth 恢复开关为 `host.logging.oauth_recovery`，默认关闭，与普通�
 
 kuhne12/codex-proxy-rs 的 main 更新后先运行 CI；同一提交的 CI 成功才触发
 [Deploy production](../.github/workflows/deploy-production.yml)。PR 本身不部署。
-手动重跑需在 Actions 选择 main，并且该提交最近一次 push CI 已成功。
+自动触发缺失时，可在 Actions 手动运行 main 的 CI，手动运行会执行完整检查。
+手动重跑部署也需选择 main，并且该提交最近一次 push 或手动 CI 已成功。
 
 流程在 GitHub 托管 ARM64 runner 构建，复用前端检查、Rust 构建和完整运行镜像验证；
 HIGH/CRITICAL 且可修复的镜像漏洞会阻止部署。镜像发布到
