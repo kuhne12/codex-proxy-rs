@@ -21,7 +21,6 @@
       "batchDeletionFailed": "Batch deletion failed"
     },
     "filters": {
-      "showPluginGroups": "Show plugin groups",
       "searchAccountGroup": "Search account group",
       "searchGroupName": "Search group name",
       "deleteSelected": "Delete ({count})",

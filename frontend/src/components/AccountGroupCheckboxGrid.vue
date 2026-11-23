@@ -2,10 +2,12 @@
 import type { AccountGroupRef } from '@/api'
 
 import { ZCheckbox } from '@codex-proxy/ui'
+import { computed } from 'vue'
 
 import { useI18n } from 'vue-i18n'
+import { isVisibleAccountGroup } from '@/utils/accountGroups'
 
-withDefaults(
+const props = withDefaults(
   defineProps<{
     groups: AccountGroupRef[]
     loading?: boolean
@@ -20,6 +22,7 @@ withDefaults(
 const { t } = useI18n({ useScope: 'global' })
 
 const selectedGroupIds = defineModel<string[]>({ required: true })
+const visibleGroups = computed(() => props.groups.filter(isVisibleAccountGroup))
 
 function updateGroup(groupId: string, selected: boolean) {
   const next = new Set(selectedGroupIds.value)
@@ -31,9 +34,9 @@ function updateGroup(groupId: string, selected: boolean) {
 </script>
 
 <template>
-  <div v-if="groups.length > 0" class="grid gap-2 sm:grid-cols-2">
+  <div v-if="visibleGroups.length > 0" class="grid gap-2 sm:grid-cols-2">
     <div
-      v-for="group in groups"
+      v-for="group in visibleGroups"
       :key="group.id"
       class="flex min-h-11 items-center justify-between gap-3 rounded-z bg-z-fill-quaternary px-3.5 py-2.5"
     >

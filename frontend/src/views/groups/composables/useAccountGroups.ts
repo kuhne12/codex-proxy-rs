@@ -16,7 +16,6 @@ import { useIdSet } from '@/composables/useIdSet'
 import { usePagedQuery } from '@/composables/usePagedQuery'
 import { useRequestState } from '@/composables/useRequestState'
 import { t } from '@/i18n'
-import { useUiStore } from '@/stores/modules/ui'
 import { notification as ZNotification } from '@/utils/notification'
 import { errorMessage } from '@/utils/operation'
 import { DEFAULT_ACCOUNT_GROUP_COLOR } from '../constants'
@@ -32,7 +31,6 @@ export interface AccountGroupFormValue {
 }
 
 export function useAccountGroups() {
-  const ui = useUiStore()
   const searchQuery = shallowRef('')
   const showFormModal = shallowRef(false)
   const showDeleteModal = shallowRef(false)
@@ -59,7 +57,7 @@ export function useAccountGroups() {
         page,
         pageSize,
         search: searchQuery.value.trim() || undefined,
-        includePluginOwned: ui.showPluginGroups,
+        includePluginOwned: false,
       }, options),
   })
 
@@ -286,10 +284,6 @@ export function useAccountGroups() {
     void query.execute({ page: 1, pageSize })
   }
 
-  watch(() => ui.showPluginGroups, () => {
-    selectedIds.value.clear()
-    void query.reloadFromStart()
-  })
   watch(searchQuery, (_value, _previous, onCleanup) => {
     const timer = setTimeout(() => {
       void query.reloadFromStart()

@@ -5,6 +5,7 @@ import { ref, shallowRef, watch } from 'vue'
 import { batchUpdateAccounts } from '@/api'
 import { useAsyncAction } from '@/composables/useAsyncAction'
 import { t } from '@/i18n'
+import { accountGroupUpdateBatches, isVisibleAccountGroup } from '@/utils/accountGroups'
 import { notification as ZNotification } from '@/utils/notification'
 import { accountSchedulingValues, concurrencyLimitInput } from '../utils/schedulingForm'
 
@@ -73,9 +74,11 @@ export function useAccountBatchEditor(options: {
       : '1')
 
     await saveAction.run(async () => {
-      const accountIds = selectedAccounts().map(account => account.id)
-      await batchUpdateAccounts({
-        accountIds,
+      const accounts = selectedAccounts()
+      const batches = accountGroupUpdateBatches(accounts, editedFields.value.has('groupIds')
+        ? selectedGroupIds.value
+        : undefined)
+      const changes = {
         modelAccess: modelAccess.value,
         outboundProxyId: proxyMode.value === 'preserve'
           ? undefined
@@ -89,23 +92,23 @@ export function useAccountBatchEditor(options: {
         weight: editedFields.value.has('weight')
           ? scheduling.weight
           : undefined,
-        groupIds: editedFields.value.has('groupIds')
-          ? [
-              ...new Set(selectedGroupIds.value),
-            ]
-          : undefined,
-      })
+      }
+      for (const batch of batches)
+        await batchUpdateAccounts({ ...changes, accountIds: batch.ids, groupIds: batch.groupIds })
       showBatchEditModal.value = false
       options.selectedIds.value = new Set()
       ZNotification.success({
-        message: t('accounts.batchEdit.saved', { count: accountIds.length }),
+        message: t('accounts.batchEdit.saved', { count: accounts.length }),
       })
       void Promise.allSettled([
         options.reloadAccounts(),
         options.reloadGroups(),
       ])
     }, {
-      onError: () => void options.reloadAccounts(),
+      onError: () => void Promise.allSettled([
+        options.reloadAccounts(),
+        options.reloadGroups(),
+      ]),
     })
   }
 
@@ -170,7 +173,7 @@ function sharedGroupIds(accounts: Account[]) {
   if (!first)
     return []
 
-  const shared = new Set(first.groups.map(group => group.id))
+  const shared = new Set(first.groups.filter(isVisibleAccountGroup).map(group => group.id))
   for (const account of rest) {
     const current = new Set(account.groups.map(group => group.id))
     for (const groupId of shared) {

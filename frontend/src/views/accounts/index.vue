@@ -12,7 +12,6 @@ import AccountGroupMarks from '@/components/AccountGroupMarks.vue'
 import LastUsedAtCell from '@/components/LastUsedAtCell.vue'
 import ProviderIconGroup from '@/components/ProviderIconGroup.vue'
 import { useAccountGroupCatalog } from '@/composables/useAccountGroupCatalog'
-import { useUiStore } from '@/stores/modules/ui'
 import AccountCreateModal from './components/account-create-modal/index.vue'
 import AccountImportTasks from './components/account-import-tasks/index.vue'
 import AccountQuotaPanel from './components/account-quota-panel/index.vue'
@@ -212,7 +211,6 @@ const {
   reloadAccounts: loadAccounts,
   reloadGroups: loadGroups,
 })
-const ui = useUiStore()
 </script>
 
 <template>
@@ -341,7 +339,7 @@ const ui = useUiStore()
 
             <template #groups="{ row }">
               <div class="flex w-full justify-center">
-                <AccountGroupMarks :groups="row.groups" :hide-plugin-groups="!ui.showPluginGroups" />
+                <AccountGroupMarks :groups="row.groups" />
               </div>
             </template>
 

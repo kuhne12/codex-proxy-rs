@@ -4,15 +4,15 @@ import type { AccountGroupRef } from '@/api'
 import { ZIconButton, ZPopover } from '@codex-proxy/ui'
 import { computed } from 'vue'
 import { useI18n } from 'vue-i18n'
+import { isVisibleAccountGroup } from '@/utils/accountGroups'
 
 const props = defineProps<{
   groups: AccountGroupRef[]
-  hidePluginGroups?: boolean
 }>()
 
 const { t } = useI18n({ useScope: 'global' })
 
-const visibleGroups = computed(() => props.groups.filter(group => !props.hidePluginGroups || !group.pluginOwned))
+const visibleGroups = computed(() => props.groups.filter(isVisibleAccountGroup))
 
 const groupMarks = computed(() =>
   visibleGroups.value.map(group => ({
