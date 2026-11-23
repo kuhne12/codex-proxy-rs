@@ -13,12 +13,12 @@ export function useAccountGroupCatalog(options: { immediate?: boolean } = {}) {
     const requestId = request.start()
     const requestOptions = { signal: request.signal }
     try {
-      const first = await getAccountGroupOptions({ page: 1, pageSize: 200 }, requestOptions)
+      const first = await getAccountGroupOptions({ page: 1, pageSize: 200, includePluginOwned: false }, requestOptions)
       if (!request.isCurrent(requestId))
         return []
       const items = [...first.items]
       for (let page = 2; page <= first.page.totalPages; page += 1) {
-        const result = await getAccountGroupOptions({ page, pageSize: first.page.pageSize }, requestOptions)
+        const result = await getAccountGroupOptions({ page, pageSize: first.page.pageSize, includePluginOwned: false }, requestOptions)
         if (!request.isCurrent(requestId))
           return []
         items.push(...result.items)

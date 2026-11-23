@@ -12,6 +12,7 @@ import { isValidInstallationSeed } from '@/api/modules/settings/profiles'
 import AccountGroupCheckboxGrid from '@/components/AccountGroupCheckboxGrid.vue'
 import ProviderRequestProfilesEditor from '@/components/client-profile/ProviderRequestProfilesEditor.vue'
 import { useAsyncAction } from '@/composables/useAsyncAction'
+import { accountGroupUpdateBatches, isVisibleAccountGroup } from '@/utils/accountGroups'
 import { notification as ZNotification } from '@/utils/notification'
 import { PROVIDER_IDS } from '@/utils/providers'
 import { apiKeyFormValue } from '../composables/useApiKeyEditor'
@@ -108,8 +109,8 @@ function sameGroups(left: string[], right: string[]) {
   return ids.size === right.length && right.every(id => ids.has(id))
 }
 const initialGroups = computed(() => {
-  const first = props.keys[0]?.groups.map(group => group.id) ?? []
-  return props.keys.every(key => sameGroups(first, key.groups.map(group => group.id)))
+  const first = props.keys[0]?.groups.filter(isVisibleAccountGroup).map(group => group.id) ?? []
+  return props.keys.every(key => sameGroups(first, key.groups.filter(isVisibleAccountGroup).map(group => group.id)))
     ? first
     : undefined
 })
@@ -124,7 +125,9 @@ const seedError = computed(() => isValidInstallationSeed(form.value.installation
   : t('settings.clientProfile.invalidInstallationSeed'))
 const invalidScope = computed(() => props.keys.some(key =>
   (form.value.peerSharing.enabled ?? key.peerSharing.enabled)
-  && (form.value.groupIds?.length ?? key.groups.length) === 0))
+  && (form.value.groupIds === undefined
+    ? key.groups.length === 0
+    : form.value.groupIds.length === 0 && !key.groups.some(group => !isVisibleAccountGroup(group)))))
 const changes = computed<ApiKeyBatchChanges>(() => {
   const draft = form.value
   const patch: ApiKeyBatchChanges = {}
@@ -161,7 +164,7 @@ watch(open, (visible) => {
 async function save() {
   if (!canSave.value || loading.value || !await formRef.value?.validate().catch(() => false))
     return
-  if (form.value.groupIds?.length === 0) {
+  if (form.value.groupIds?.length === 0 && props.keys.some(key => key.groups.every(isVisibleAccountGroup))) {
     confirmAll.value = true
     return
   }
@@ -169,14 +172,28 @@ async function save() {
 }
 async function applyChanges() {
   confirmAll.value = false
+  const savedIds: string[] = []
   await run(async () => {
     const ids = props.keys.map(key => key.id)
-    const result = await batchUpdateApiKeys({ ids, ...changes.value })
+    const patch = changes.value
+    const batches = accountGroupUpdateBatches(props.keys, patch.groupIds)
+    let updated = 0
+    for (const batch of batches) {
+      const result = await batchUpdateApiKeys({ ...patch, ids: batch.ids, groupIds: batch.groupIds })
+      updated += result.updated
+      savedIds.push(...batch.ids)
+    }
     open.value = false
     emit('saved', ids)
     ZNotification.success({
-      message: t('keys.batch.updated', { count: result.updated }),
+      message: t('keys.batch.updated', { count: updated }),
     })
+  }, {
+    onError: () => {
+      // 分批保存可能已完成部分记录，刷新列表以反映实际结果
+      if (savedIds.length)
+        emit('saved', savedIds)
+    },
   })
 }
 </script>
@@ -195,7 +212,7 @@ async function applyChanges() {
           :model-value="form.groupIds ?? initialGroups ?? []" :groups="groups" :loading="groupLoading" :disabled="loading"
           @update:model-value="updateGroups"
         />
-        <p v-if="form.groupIds?.length === 0" class="mt-2 mb-0 text-z-sm text-z-text-secondary">
+        <p v-if="form.groupIds?.length === 0 && keys.some(key => key.groups.every(isVisibleAccountGroup))" class="mt-2 mb-0 text-z-sm text-z-text-secondary">
           {{ t('keys.scope.allAccounts.description') }}
         </p>
       </ZFormItem>

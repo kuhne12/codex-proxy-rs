@@ -5,7 +5,6 @@ export const useUiStore = defineStore(
   'ui',
   () => {
     const sidebarCollapsed = shallowRef(false)
-    const showPluginGroups = shallowRef(false)
     const showPluginKeys = shallowRef(false)
 
     function toggleSidebar(): void {
@@ -14,7 +13,6 @@ export const useUiStore = defineStore(
 
     return {
       sidebarCollapsed,
-      showPluginGroups,
       showPluginKeys,
       toggleSidebar,
     }
@@ -22,7 +20,7 @@ export const useUiStore = defineStore(
   {
     persist: {
       key: 'codex-proxy-rs-ui',
-      pick: ['sidebarCollapsed', 'showPluginGroups', 'showPluginKeys'],
+      pick: ['sidebarCollapsed', 'showPluginKeys'],
     },
   },
 )

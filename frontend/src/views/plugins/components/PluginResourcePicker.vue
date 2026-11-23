@@ -5,6 +5,7 @@ import { LoaderCircle } from '@lucide/vue'
 import { computed, onScopeDispose, shallowRef, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { getAccountGroups, getApiKeys } from '@/api'
+import { isVisibleAccountGroup } from '@/utils/accountGroups'
 import { notification as ZNotification } from '@/utils/notification'
 import { errorMessage } from '@/utils/operation'
 
@@ -14,15 +15,31 @@ const { t } = useI18n({ useScope: 'global' })
 
 const selected = defineModel<string[]>({ required: true })
 const options = shallowRef<{ id: string, label: string, disabled: boolean }[]>([])
+const hiddenGroupIds = shallowRef(new Set<string>())
 const loading = shallowRef(false)
 const error = shallowRef('')
+const visibleSelected = computed({
+  get: () => props.kind === 'groups' && (loading.value || error.value)
+    ? []
+    : selected.value.filter(id => !hiddenGroupIds.value.has(id)),
+  set: (ids: string[]) => {
+    selected.value = [
+      ...new Set([
+        ...ids,
+        ...selected.value.filter(id => hiddenGroupIds.value.has(id)),
+      ]),
+    ]
+  },
+})
 const label = computed(() => props.kind === 'keys'
   ? t('plugins.bindings.clientKey')
   : t('plugins.bindings.accountGrouping'))
 let controller: AbortController | undefined
 const choices = computed(() => {
   const known = new Set(options.value.map(option => option.id))
-  const unavailable = selected.value.filter(id => !known.has(id)).map(id => ({
+  const unavailable = (loading.value
+    ? []
+    : visibleSelected.value).filter(id => !known.has(id)).map(id => ({
     id,
     label: t('plugins.resources.unavailable', { id }),
     disabled: true,
@@ -37,7 +54,7 @@ const choices = computed(() => {
       ? t('common.status.unavailable')
       : undefined,
     // 已失效的绑定仍可取消，不能重新选入。
-    disabled: option.disabled && !selected.value.includes(option.id),
+    disabled: option.disabled && !visibleSelected.value.includes(option.id),
   }))
 })
 async function load() {
@@ -47,6 +64,7 @@ async function load() {
   loading.value = true
   error.value = ''
   const items: typeof options.value = []
+  const hiddenIds = new Set<string>()
   try {
     const requestOptions = { signal: current.signal, silent: true }
     if (props.kind === 'keys') {
@@ -62,13 +80,20 @@ async function load() {
       let totalPages = 1
       do {
         const result = await getAccountGroups({ page, pageSize: 100 }, requestOptions)
-        items.push(...result.items.map(item => ({ id: item.id, label: item.name, disabled: !item.enabled })))
+        for (const item of result.items) {
+          if (isVisibleAccountGroup(item))
+            items.push({ id: item.id, label: item.name, disabled: !item.enabled })
+          else
+            hiddenIds.add(item.id)
+        }
         totalPages = result.page.totalPages
         page++
       } while (page <= totalPages)
     }
-    if (controller === current)
+    if (controller === current) {
       options.value = items
+      hiddenGroupIds.value = hiddenIds
+    }
   }
   catch (cause) {
     if (!current.signal.aborted) {
@@ -96,7 +121,7 @@ onScopeDispose(() => controller?.abort())
 
 <template>
   <ZSelect
-    v-model="selected"
+    v-model="visibleSelected"
     :options="choices"
     multiple
     collapse-tags

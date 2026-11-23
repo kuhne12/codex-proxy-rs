@@ -1,13 +1,13 @@
 <script setup lang="ts">
 import type { AccountGroupRef } from '@/api'
 
-import { ZButton, ZCheckbox, ZIconButton, ZInput, ZMenuItem, ZPopover, ZSelect } from '@codex-proxy/ui'
+import { ZButton, ZIconButton, ZInput, ZMenuItem, ZPopover, ZSelect } from '@codex-proxy/ui'
 import { Download, ListTodo, MoreHorizontal, Pencil, Search, Trash2, Upload } from '@lucide/vue'
 
-import { computed, watch } from 'vue'
+import { computed } from 'vue'
 import { useI18n } from 'vue-i18n'
 import ProviderFilter from '@/components/ProviderFilter.vue'
-import { useUiStore } from '@/stores/modules/ui'
+import { isVisibleAccountGroup } from '@/utils/accountGroups'
 import { accountStatusFilterOptions } from '../constants'
 
 const props = defineProps<{
@@ -29,7 +29,6 @@ const emit = defineEmits<{
   editSelected: []
 }>()
 
-const ui = useUiStore()
 const { t } = useI18n({ useScope: 'global' })
 
 const search = defineModel<string>('search', { required: true })
@@ -45,18 +44,13 @@ const groupOptions = computed(() => [
     label: t('accounts.filters.ungroupedAccounts'),
     value: 'ungrouped',
   },
-  ...props.groups.filter(group => ui.showPluginGroups || !group.pluginOwned).map(group => ({
+  ...props.groups.filter(isVisibleAccountGroup).map(group => ({
     label: group.enabled
       ? group.name
       : t('accounts.filters.disabled', { name: group.name }),
     value: group.id,
   })),
 ])
-
-watch(() => ui.showPluginGroups, (show) => {
-  if (!show && props.groups.some(item => item.id === group.value && item.pluginOwned))
-    group.value = ''
-})
 </script>
 
 <template>
@@ -93,8 +87,6 @@ watch(() => ui.showPluginGroups, (show) => {
         :aria-label="t('accounts.filters.groupLabel')"
         class="w-full min-w-0 xl:w-40 xl:shrink-0"
       />
-
-      <ZCheckbox v-model="ui.showPluginGroups" :label="t('groups.filters.showPluginGroups')" class="col-span-2 sm:col-span-3" />
 
       <ProviderFilter
         v-model="provider"
